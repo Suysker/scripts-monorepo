@@ -16,6 +16,24 @@
     const MATCH_USER = [/\/api\/payment\/getPaymentInfo/i, /\/api\/user\/info/i];
     const MATCH_PLAY = [/\/v3\/video\/play/i, /\/v3\/video\/detail/i];
 
+    const normalizeUrl = (input) => {
+        try {
+            if (input && typeof input === 'object' && input.url) input = input.url;
+        } catch (e) {}
+        if (typeof input !== 'string') {
+            try {
+                input = String(input);
+            } catch (e) {
+                return '';
+            }
+        }
+        try {
+            return new URL(input, location.href).toString();
+        } catch (e) {
+            return input;
+        }
+    };
+
     const shouldMatch = (url, list) => list.some(r => r.test(url));
 
     const patchUser = (json) => {
@@ -58,8 +76,7 @@
         const originalFetch = root.fetch;
         if (typeof originalFetch !== 'function') return;
         root.fetch = async function(...args) {
-            let url = args[0];
-            if (typeof url !== 'string') url = url.toString();
+            const url = normalizeUrl(args[0]);
             if (shouldMatch(url, MATCH_USER)) {
                 const response = await originalFetch.apply(this, args);
                 const json = patchUser(await safeJson(response));
@@ -79,36 +96,47 @@
 
     const hookXhr = (root) => {
         if (!root || root.__yfsp_xhr_hooked) return;
-        const OriginalXHR = root.XMLHttpRequest;
-        if (!OriginalXHR) return;
-        function WrappedXHR() {
-            const xhr = new OriginalXHR();
-            const originalOpen = xhr.open;
-            const originalSend = xhr.send;
-            let requestUrl = '';
-            xhr.open = function(method, url, ...rest) {
-                requestUrl = url ? url.toString() : '';
-                return originalOpen.call(this, method, url, ...rest);
-            };
-            xhr.send = function(...sendArgs) {
-                this.addEventListener('readystatechange', function() {
-                    if (this.readyState !== 4) return;
-                    if (!requestUrl) return;
-                    if (!(shouldMatch(requestUrl, MATCH_USER) || shouldMatch(requestUrl, MATCH_PLAY))) return;
+        const proto = root.XMLHttpRequest && root.XMLHttpRequest.prototype;
+        if (!proto || proto.__yfsp_patched) return;
+        const originalOpen = proto.open;
+        const originalSend = proto.send;
+        proto.open = function(method, url, ...rest) {
+            this.__yfsp_url = normalizeUrl(url);
+            return originalOpen.call(this, method, url, ...rest);
+        };
+        proto.send = function(...sendArgs) {
+            const listener = () => {
+                if (this.readyState !== 4) return;
+                this.removeEventListener('readystatechange', listener);
+                const requestUrl = this.__yfsp_url || '';
+                if (!requestUrl) return;
+                if (!(shouldMatch(requestUrl, MATCH_USER) || shouldMatch(requestUrl, MATCH_PLAY))) return;
+                if (this.responseType && this.responseType !== 'text' && this.responseType !== 'json' && this.responseType !== '') return;
+                let json = null;
+                if (this.responseType === 'json') {
+                    if (this.response && typeof this.response === 'object') json = this.response;
+                } else {
+                    const text = this.responseText;
+                    if (!text || text[0] !== '{') return;
                     try {
-                        const text = this.responseText;
-                        if (!text || text[0] !== '{') return;
-                        let json = JSON.parse(text);
-                        json = shouldMatch(requestUrl, MATCH_USER) ? patchUser(json) : patchPlay(json);
-                        Object.defineProperty(this, 'responseText', { value: JSON.stringify(json) });
-                        Object.defineProperty(this, 'response', { value: JSON.stringify(json) });
-                    } catch (e) {}
-                }, false);
-                return originalSend.apply(this, sendArgs);
+                        json = JSON.parse(text);
+                    } catch (e) {
+                        return;
+                    }
+                }
+                json = shouldMatch(requestUrl, MATCH_USER) ? patchUser(json) : patchPlay(json);
+                const jsonText = JSON.stringify(json);
+                try {
+                    Object.defineProperty(this, 'responseText', { configurable: true, get: () => jsonText });
+                } catch (e) {}
+                try {
+                    Object.defineProperty(this, 'response', { configurable: true, get: () => (this.responseType === 'json' ? json : jsonText) });
+                } catch (e) {}
             };
-            return xhr;
-        }
-        root.XMLHttpRequest = WrappedXHR;
+            this.addEventListener('readystatechange', listener);
+            return originalSend.apply(this, sendArgs);
+        };
+        proto.__yfsp_patched = true;
         root.__yfsp_xhr_hooked = true;
     };
 
@@ -122,6 +150,9 @@
             'iframe[src*="doubleclick"] { display: none !important; }',
             '.ad, .ads, [id*="ad_"], [class*="ad-"] { display: none !important; }',
             '.use-coin-box { display: none !important; }',
+            '#coin-or-upgrade-to-skip-ad { display: none !important; }',
+            '.dn-dialog-background { display: none !important; }',
+            '#dn_iframe { display: none !important; }',
             'vg-quality-selector .vip-label { display: none !important; }',
             '.quality-btn { opacity: 1 !important; pointer-events: auto !important; }'
         ].join('\n');
@@ -138,6 +169,25 @@
         } catch (e) {}
     };
 
+    const hideAds = () => {
+        const dialog = document.getElementById('coin-or-upgrade-to-skip-ad');
+        if (dialog) dialog.style.display = 'none';
+        const dnIframe = document.getElementById('dn_iframe');
+        if (dnIframe) dnIframe.style.display = 'none';
+        const dialogs = document.querySelectorAll('dn-dialog, .dn-dialog-background');
+        dialogs.forEach(el => { el.style.display = 'none'; });
+    };
+
+    const observeDom = () => {
+        if (window.__yfsp_observer) return;
+        const obs = new MutationObserver(() => {
+            ensureStyle();
+            hideAds();
+        });
+        obs.observe(document.documentElement, { childList: true, subtree: true });
+        window.__yfsp_observer = obs;
+    };
+
     const bootstrap = () => {
         hookFetch(window);
         hookXhr(window);
@@ -148,6 +198,8 @@
         }
         applyGlobals(window);
         ensureStyle();
+        hideAds();
+        observeDom();
     };
 
     bootstrap();
