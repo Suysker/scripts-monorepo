@@ -65,6 +65,31 @@
 - `onGetBitrates` 与 `onLevelChanged` 关联播放器层级变化事件
 - `Clarity(t)`、`reloadPause(t)` 与 `checkIsBought(t)` 关联清晰度切换与权限校验
 
+### 2.5 前端拦截点与脚本化修复策略
+
+页面端在 `selectBitrate(t)` 内部存在权限短路分支，导致未登录或未购买时直接返回并阻断请求。实际行为表现为点击“蓝光1080P”后 UI 长时间停留在“正在切换清晰度”，但未发起 `/v3/video/play` 请求。脚本侧可通过以下策略绕过前端拦截：
+
+- 将 `bitrates` 中的 `isVIP` 置为 `false`、`isBought` 置为 `true` 并启用 `isEnabled`
+- 在组件实例上补齐 `_user.id` 与 `_user.roleId`（非空且非负）
+- 在运行时覆写 `selectBitrate`，确保调用前清理 `t.isVIP` 并设置 `t.isBought`
+- 对组件原型方法做全局覆盖，避免实例被替换后失效
+
+### 2.6 DevTools 验证结论
+
+通过 Chromium DevTools 直接执行 `selectBitrate` 并观察网络请求，发现前端即使完成状态修正也不会触发新的 `/v3/video/play` 请求。对应的 `clarity` 列表中 `1080` 条目 `path` 为 `null`，说明服务端未下发该清晰度流地址，前端仅靠脚本改动无法生成有效播放源。
+
+### 2.7 弹幕样式与倍速前端拦截补充
+
+前端对弹幕样式（颜色、类型、字体、头像/昵称、国家显示）与倍速切换存在额外的 UI 侧权限校验。脚本侧需要同时覆盖组件原型方法与数据列表的 `vipFunction/disabled/lock` 标记，并在运行时刷新用户态（`roleId/level/isVip`），才能避免按钮点击被 UI 拦截或直接返回。
+
+当前脚本的说明已覆盖解锁范围（清晰度 UI、弹幕样式与倍速）与已知的服务端限制（高码率 path 为空时无法获取真实流地址）。
+
+为避免切换清晰度时卡在“正在切换清晰度”，脚本会在拦截 `/v3/video/play` 返回时，使用已存在的可用清晰度 `path` 回填其他清晰度条目，同时解锁 `isBought/isVIP/isEnabled` 标记，以保持播放器切换流程可继续。
+
+### 2.8 VIP 表情与投票入口拦截点
+
+评论区“发起投票”入口由评论组件方法 `openVotingCreatorDialog` 控制，触发条件为 `user.roleId` 与权限 `PublishVote` 校验失败时弹出 `vip-only` 对话框。VIP 表情入口由表情面板组件方法 `canNotUseVipEmoj` 判断，返回 true 时会弹出 `vip-only`。脚本侧需覆盖这两个方法并刷新用户态，才能解除前端拦截。
+
 ## 3. 关键 API 接口分析
 
 ### 3.1 视频播放信息 (`/v3/video/play`)
