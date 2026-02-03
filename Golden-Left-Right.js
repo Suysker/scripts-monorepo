@@ -3,7 +3,7 @@
 // @description  按住"→"键倍速播放，按住"←"键减速播放，松开恢复原来的倍速，轻松追剧，看视频更灵活，还能快进/跳过大部分网站的广告！~ 支持用户单独配置倍速和秒数，并可根据根域名启用或禁用脚本
 // @icon         https://image.suysker.xyz/i/2023/10/09/artworks-QOnSW1HR08BDMoe9-GJTeew-t500x500.webp
 // @namespace    http://tampermonkey.net/
-// @version      1.0.9
+// @version      1.0.10
 // @author       Suysker
 // @match        http://*/*
 // @match        https://*/*
@@ -130,19 +130,35 @@
     };
 
     /**
-     * Checks if any input-related element (除了 <input type="range">) is currently focused.
+     * Checks if any input-related element (except safe ones) is currently focused.
      * @returns {boolean} - True if an input is focused, else false.
      */
     const isInputFocused = () => {
         const activeElement = document.activeElement;
-        // 如果当前激活的元素是 <input type="range"> 则忽略（不阻止脚本响应）
-        if (activeElement && activeElement.tagName.toLowerCase() === 'input' && activeElement.type === 'range') {
-            return false;
+        if (!activeElement) return false;
+
+        // 1. ContentEditable -> Block
+        if (activeElement.isContentEditable) return true;
+
+        const tagName = activeElement.tagName.toLowerCase();
+
+        // 2. Specific tags -> Block (Removed 'button' from blocking)
+        if (tagName === 'textarea' || tagName === 'select') return true;
+
+        // 3. Input tag handling
+        if (tagName === 'input') {
+             // Exception: range is allowed (for seeking)
+             if (activeElement.type === 'range') return false;
+             
+             // Exception: button-like inputs are allowed (don't block hotkeys)
+             const buttonTypes = ['button', 'submit', 'reset', 'image'];
+             if (buttonTypes.includes(activeElement.type)) return false;
+
+             // All other inputs (text, password, checkbox, radio, etc.) -> Block
+             return true;
         }
-        const inputTypes = ['input', 'textarea', 'select', 'button'];
-        const isContentEditable = activeElement && activeElement.isContentEditable;
-        const isInputElement = activeElement && inputTypes.includes(activeElement.tagName.toLowerCase());
-        return isContentEditable || isInputElement;
+
+        return false;
     };
 
     /**
