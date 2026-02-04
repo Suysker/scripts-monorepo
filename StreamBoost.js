@@ -3,7 +3,7 @@
 // @namespace    streamboost
 // @icon         https://image.suysker.xyz/i/2023/10/09/artworks-QOnSW1HR08BDMoe9-GJTeew-t500x500.webp
 // @namespace    http://tampermonkey.net/
-// @version      1.0.1
+// @version      1.0.2
 // @description  通用流媒体加速：加大缓冲、并发预取、内存命中、在途合并、按站点启停、修复部分站点自定义 Loader 导致的串行；当前覆盖 HLS.js，后续可扩展至其它播放器/协议。
 // @match        *://*/*
 // @run-at       document-start
@@ -137,6 +137,19 @@
   const PAYLOAD = `
   (function(){
     'use strict';
+
+    if (typeof localStorage !== 'undefined') {
+      try {
+        const DEBUG = (localStorage.getItem('HLS_BIGBUF_DEBUG') === '1');
+        if (DEBUG) console.log('[HLS BigBuffer] payload start', location.href, window === window.top ? 'top' : 'iframe');
+      } catch {}
+    }
+    try {
+      if (!window.__HLS_BIGBUF_ACTIVE__) {
+        window.__HLS_BIGBUF_ACTIVE__ = true;
+        console.info('[HLS BigBuffer] 已激活', location.href, window === window.top ? 'top' : 'iframe');
+      }
+    } catch {}
 
     // —— 固定原生实现，绕过站点改写 —— //
     const Native = (() => {
@@ -664,7 +677,24 @@
         class PatchedHls extends OriginalHls {
           constructor(userConfig = {}){
             const enforced = Object.assign({}, overrides, userConfig);
-            if (ENABLE_MEMCACHE) enforced.fLoader = CacheFirstFragLoader;
+
+            // 动态适配自定义 Loader (修复部分站点因自定义 Loader 被覆盖而无法播放的问题)
+            if (ENABLE_MEMCACHE) {
+              const UserLoader = userConfig.fLoader || userConfig.loader;
+              if (UserLoader) {
+                class CustomFragLoader extends CacheFirstFragLoader {
+                  constructor(cfg) {
+                    super(cfg);
+                    try { this.inner = new UserLoader(cfg); } catch(e) { log('CustomFragLoader init failed', e); }
+                  }
+                }
+                enforced.fLoader = CustomFragLoader;
+                log('Wrapped custom loader for compatibility', UserLoader);
+              } else {
+                enforced.fLoader = CacheFirstFragLoader;
+              }
+            }
+
             super(enforced);
             window.__HLS_BIGBUF_LAST__ = this;
 
@@ -754,7 +784,7 @@
               }catch{ return false; }
             })()
           };
-          console.warn('[HLS BigBuffer] 顶层未检测到 Hls（播放器可能在 iframe / 或用 video.js / dash.js / 原生HLS）诊断：', hints);
+          console.warn('[HLS BigBuffer] 顶层未检测到 Hls（播放器在跨域 iframe 内时属于正常情况；若已看到 iframe 的“已激活”提示可忽略）。诊断：', hints);
         }
       }, 8000);
     }
@@ -772,12 +802,27 @@
         }
         return;
       }
+    } catch {}
+
+    if (!doc.documentElement) {
+      const onReady = () => {
+        doc.removeEventListener('readystatechange', onReady);
+        injectInto(doc);
+      };
+      doc.addEventListener('readystatechange', onReady);
+      return;
+    }
+
+    try {
       if (typeof GM_addElement === 'function') {
         GM_addElement(doc.documentElement, 'script', { textContent: PAYLOAD });
         return;
       }
     } catch {}
+
     const s = doc.createElement('script');
+    const nonce = doc.querySelector('script[nonce]')?.nonce;
+    if (nonce) s.setAttribute('nonce', nonce);
     s.textContent = PAYLOAD;
     (doc.head || doc.documentElement).appendChild(s);
     s.remove();
