@@ -179,17 +179,48 @@
     const BACK_BUFFER_SEC    = 180;
     const MAX_MAX_BUFFER_SEC = 1800;
 
+    const SITE_RULES = [];
+    function matchHostRule(ruleHost, host) {
+      const rh = String(ruleHost || '').toLowerCase().trim();
+      const h = String(host || '').toLowerCase().trim();
+      if (!rh || !h) return false;
+      if (rh.startsWith('*.')) {
+        const suf = rh.slice(2);
+        return h === suf || h.endsWith('.' + suf);
+      }
+      return h === rh;
+    }
+    function pickSiteRule(host) {
+      for (const r of SITE_RULES) {
+        if (r && matchHostRule(r.host, host)) return r;
+      }
+      return null;
+    }
+    const siteRule = pickSiteRule(location.hostname);
+
     // —— 开关 —— //
-    const ENABLE_PREFETCH = (localStorage.getItem('HLS_BIGBUF_PREFETCH') ?? '1') === '1';
-    const ENABLE_MEMCACHE = (localStorage.getItem('HLS_BIGBUF_CACHE')    ?? '1') === '1';
-    const DEBUG           = (localStorage.getItem('HLS_BIGBUF_DEBUG') === '1');
+    let ENABLE_PREFETCH = (localStorage.getItem('HLS_BIGBUF_PREFETCH') ?? '1') === '1';
+    let ENABLE_MEMCACHE = (localStorage.getItem('HLS_BIGBUF_CACHE')    ?? '1') === '1';
+    const DEBUG         = (localStorage.getItem('HLS_BIGBUF_DEBUG') === '1');
 
     // —— 预取参数 —— //
-    const PREFETCH_AHEAD           = 12;
-    const PREFETCH_CONC_GLOBAL     = +(localStorage.getItem('HLS_BIGBUF_CONC_GLOBAL')     || 4);
-    const PREFETCH_CONC_PER_ORIGIN = +(localStorage.getItem('HLS_BIGBUF_CONC_PER_ORIGIN') || 4);
-    const PREFETCH_TIMEOUT_MS      = 15000;
-    const WAIT_INFLIGHT_MS         = 500;
+    let PREFETCH_AHEAD           = 12;
+    let PREFETCH_CONC_GLOBAL     = +(localStorage.getItem('HLS_BIGBUF_CONC_GLOBAL')     || 4);
+    let PREFETCH_CONC_PER_ORIGIN = +(localStorage.getItem('HLS_BIGBUF_CONC_PER_ORIGIN') || 4);
+    let PREFETCH_TIMEOUT_MS      = 15000;
+    let WAIT_INFLIGHT_MS         = 500;
+    let PREFETCH_STRATEGY        = 'xhr-hls-fetch';
+
+    if (siteRule) {
+      if (typeof siteRule.prefetch === 'boolean') ENABLE_PREFETCH = siteRule.prefetch;
+      if (typeof siteRule.memcache === 'boolean') ENABLE_MEMCACHE = siteRule.memcache;
+      if (typeof siteRule.prefetchStrategy === 'string') PREFETCH_STRATEGY = siteRule.prefetchStrategy;
+      if (typeof siteRule.prefetchAhead === 'number') PREFETCH_AHEAD = Math.max(0, siteRule.prefetchAhead | 0);
+      if (typeof siteRule.prefetchConcGlobal === 'number') PREFETCH_CONC_GLOBAL = Math.max(1, siteRule.prefetchConcGlobal | 0);
+      if (typeof siteRule.prefetchConcPerOrigin === 'number') PREFETCH_CONC_PER_ORIGIN = Math.max(1, siteRule.prefetchConcPerOrigin | 0);
+      if (typeof siteRule.prefetchTimeoutMs === 'number') PREFETCH_TIMEOUT_MS = Math.max(1000, siteRule.prefetchTimeoutMs | 0);
+      if (typeof siteRule.waitInflightMs === 'number') WAIT_INFLIGHT_MS = Math.max(0, siteRule.waitInflightMs | 0);
+    }
 
     // —— 失败节流/熔断 —— //
     const FAIL_TTL_MS      = 45000;
@@ -273,6 +304,15 @@
     const recentFailMap= new Map();
     const floorSN      = new Map();
     const originSlots  = new Map(); // origin -> n
+    function clearOriginPenalty(origin){
+      if (!origin) return;
+      originFailCount.delete(origin);
+      originBanUntil.delete(origin);
+    }
+    function clearUrlPenalty(url){
+      if (!url) return;
+      recentFailMap.delete(url);
+    }
 
     function takeOriginSlot(origin) {
       const cap = (origin && origin === location.origin) ? PREFETCH_CONC_GLOBAL : PREFETCH_CONC_PER_ORIGIN;
@@ -597,9 +637,35 @@
 
         if (inflightMap.size >= PREFETCH_CONC_GLOBAL) return null;
 
-        let p = prefetchWithXHR(hls, details, nf, url, origin);
-        if (!p) p = prefetchWithHlsLoader(hls, details, nf, url, origin);
-        if (!p) p = prefetchWithFetch(details, nf, url, origin);
+        const chain =
+          PREFETCH_STRATEGY === 'hls-xhr-fetch' ? [
+            () => prefetchWithHlsLoader(hls, details, nf, url, origin),
+            () => prefetchWithXHR(hls, details, nf, url, origin),
+            () => prefetchWithFetch(details, nf, url, origin)
+          ] :
+          PREFETCH_STRATEGY === 'hls-only' ? [
+            () => prefetchWithHlsLoader(hls, details, nf, url, origin)
+          ] :
+          PREFETCH_STRATEGY === 'xhr-only' ? [
+            () => prefetchWithXHR(hls, details, nf, url, origin)
+          ] :
+          PREFETCH_STRATEGY === 'fetch-only' ? [
+            () => prefetchWithFetch(details, nf, url, origin)
+          ] :
+          PREFETCH_STRATEGY === 'fetch-xhr-hls' ? [
+            () => prefetchWithFetch(details, nf, url, origin),
+            () => prefetchWithXHR(hls, details, nf, url, origin),
+            () => prefetchWithHlsLoader(hls, details, nf, url, origin)
+          ] : [
+            () => prefetchWithXHR(hls, details, nf, url, origin),
+            () => prefetchWithHlsLoader(hls, details, nf, url, origin),
+            () => prefetchWithFetch(details, nf, url, origin)
+          ];
+        let p = null;
+        for (const fn of chain) {
+          p = fn();
+          if (p) break;
+        }
 
         p?.then(buf => { if (!buf) recentFailMap.set(url, performance.now()); })
           .finally(()=>{ inflightMeta.delete(url); inflightMap.delete(url); });
@@ -644,7 +710,18 @@
         }
 
         hls.on(Ev.FRAG_LOADING, (_evt, data) => { scheduleAheadFromFrag(data && data.frag); });
-        hls.on(Ev.FRAG_LOADED,  (_evt, data) => { scheduleAheadFromFrag(data && data.frag); });
+        hls.on(Ev.FRAG_LOADED,  (_evt, data) => {
+          const frag = data && data.frag;
+          scheduleAheadFromFrag(frag);
+          try {
+            const url = frag && (frag.url || frag._url);
+            if (url) {
+              clearUrlPenalty(url);
+              const origin = new URL(url, location.href).origin;
+              clearOriginPenalty(origin);
+            }
+          } catch {}
+        });
 
         log('prefetcher attached (XHR→HlsLoader→fetch; ahead=', PREFETCH_AHEAD, ', global=', PREFETCH_CONC_GLOBAL, ', perOrigin=', PREFETCH_CONC_PER_ORIGIN, ', wait=', WAIT_INFLIGHT_MS, 'ms)');
       }
@@ -656,6 +733,17 @@
     function protectGlobal(name, value){
       try { delete window[name]; } catch {}
       Object.defineProperty(window, name, { value, writable:false, configurable:true, enumerable:false });
+    }
+    const adapters = [];
+    function registerAdapter(adapter){
+      if (!adapter || typeof adapter.install !== 'function') return;
+      adapters.push(adapter);
+    }
+    function runAdapters(){
+      for (const adapter of adapters) {
+        try { adapter.install(); }
+        catch (e) { warn('adapter install failed', adapter?.name || 'unknown', e); }
+      }
     }
 
     function patchHlsClass(OriginalHls){
@@ -788,8 +876,8 @@
         }
       }, 8000);
     }
-
-    armSetterOnce();
+    registerAdapter({ name: 'hls', install: armSetterOnce });
+    runAdapters();
   })();
   `;
 
