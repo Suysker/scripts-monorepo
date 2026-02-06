@@ -3,7 +3,15 @@
 > **通用流媒体加速缓冲脚本：扩大缓冲、并发预取、内存命中、在途合并、站点级启停，一把梭！**
 > 现已深度适配 **HLS.js**，后续可拓展到更多播放器/协议。
 
-![License](https://img.shields.io/github/license/Suysker/Golden-Left-Right?style=flat-square) ![Downloads](https://img.shields.io/greasyfork/dt/507274?style=flat-square) ![Version](https://img.shields.io/greasyfork/v/507274?style=flat-square) ![Tampermonkey](https://img.shields.io/badge/Tampermonkey-5.1.1-red.svg?style=popout-square) ![Tampermonkey](https://img.shields.io/badge/Tampermonkey-Beta-red.svg?style=popout-square)
+![License](https://img.shields.io/github/license/Suysker/js-scripts-monorepo?style=flat-square) ![Downloads](https://img.shields.io/greasyfork/dt/507274?style=flat-square) ![Version](https://img.shields.io/greasyfork/v/507274?style=flat-square) ![Tampermonkey](https://img.shields.io/badge/Tampermonkey-5.1.1-red.svg?style=popout-square) ![Tampermonkey](https://img.shields.io/badge/Tampermonkey-Beta-red.svg?style=popout-square)
+
+---
+
+## 📁 仓库位置（Monorepo）
+
+- [Monorepo 根目录](../)
+- [当前项目目录](./)
+- [GitHub 仓库](https://github.com/Suysker/js-scripts-monorepo)
 
 ---
 
@@ -32,8 +40,11 @@
 ## 📥 安装方式
 
 1. 安装浏览器扩展 **Tampermonkey**（或兼容脚本管理器）。
-2. 打开本仓库脚本文件，点 **Raw** 进行安装（或在 Greasy Fork 页安装）。
+2. 打开 `StreamBoost/StreamBoost.js`，点 **Raw** 进行安装（或在 Greasy Fork 页安装）。
 3. 刷新含播放器的页面即可体验加速。
+
+脚本源码地址（Raw）：
+`https://raw.githubusercontent.com/Suysker/js-scripts-monorepo/main/StreamBoost/StreamBoost.js`
 
 > 兼容：Chrome / Edge / Firefox（现代版本）。Safari 因扩展限制可能需要额外授权。
 
@@ -97,5 +108,8 @@
 
 ## 🤝 反馈与贡献
 
+* 项目地址：
+  [Monorepo 根目录](../) / [当前项目目录](./) / [GitHub 仓库](https://github.com/Suysker/js-scripts-monorepo)
 * 提交 Issue / PR：**GitHub Issues / Pull Requests**
+* Issues 入口：`https://github.com/Suysker/js-scripts-monorepo/issues`
 * 欢迎提供站点兼容性、复现步骤与优化建议。喜欢就点个 ⭐ Star，感谢支持！

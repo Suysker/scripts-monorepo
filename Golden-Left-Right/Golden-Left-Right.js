@@ -10,8 +10,8 @@
 // @grant        GM_registerMenuCommand
 // @grant        GM_setValue
 // @grant        GM_getValue
-// @homepage     https://github.com/Suysker/Golden-Left-Right
-// @supportURL   https://github.com/Suysker/Golden-Left-Right
+// @homepage     https://github.com/Suysker/js-scripts-monorepo/tree/main/Golden-Left-Right
+// @supportURL   https://github.com/Suysker/js-scripts-monorepo/issues
 // ==/UserScript==
 
 (function () {

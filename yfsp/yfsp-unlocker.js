@@ -8,6 +8,8 @@
 // @match        *://*.dudupro.com/*
 // @run-at       document-start
 // @grant        unsafeWindow
+// @homepage     https://github.com/Suysker/js-scripts-monorepo/tree/main/yfsp
+// @supportURL   https://github.com/Suysker/js-scripts-monorepo/issues
 // ==/UserScript==
 
 (function() {

@@ -9,8 +9,8 @@
 // @run-at       document-start
 // @grant        GM_registerMenuCommand
 // @grant        GM_addElement
-// @homepage     https://github.com/Suysker/StreamBoost
-// @supportURL   https://github.com/Suysker/StreamBoost
+// @homepage     https://github.com/Suysker/js-scripts-monorepo/tree/main/StreamBoost
+// @supportURL   https://github.com/Suysker/js-scripts-monorepo/issues
 // ==/UserScript==
 
 (() => {
