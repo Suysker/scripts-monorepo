@@ -11,16 +11,16 @@ After this change, there will be one Git repository that contains all three Java
 ## Progress
 
 - [x] (2026-02-06 00:00Z) Created the target repository at `c:/Github/js-scripts-monorepo`, initialized Git, and copied planning rules into `.agent/PLANS.md`.
-- [ ] Import `c:/Github/Golden-Left-Right` into `c:/Github/js-scripts-monorepo/Golden-Left-Right` with preserved history.
-- [ ] Import `c:/Github/StreamBoost` into `c:/Github/js-scripts-monorepo/StreamBoost` with preserved history.
-- [ ] Import `c:/Github/yfsp` into `c:/Github/js-scripts-monorepo/yfsp` with preserved history.
-- [ ] Add top-level documentation in `c:/Github/js-scripts-monorepo/README.md` describing layout, migration result, and verification.
-- [ ] Run migration validation commands and capture evidence in this file.
+- [x] (2026-02-06 00:10Z) Imported `c:/Github/Golden-Left-Right` into `c:/Github/js-scripts-monorepo/Golden-Left-Right` with preserved history via `git subtree add`.
+- [x] (2026-02-06 00:11Z) Imported `c:/Github/StreamBoost` into `c:/Github/js-scripts-monorepo/StreamBoost` with preserved history via `git subtree add`.
+- [x] (2026-02-06 00:12Z) Imported `c:/Github/yfsp` into `c:/Github/js-scripts-monorepo/yfsp` with preserved history via `git subtree add`.
+- [x] (2026-02-06 00:14Z) Added top-level documentation in `c:/Github/js-scripts-monorepo/README.md` describing layout, migration result, and verification.
+- [x] (2026-02-06 00:16Z) Ran migration validation commands and captured evidence in this file.
 
 ## Surprises & Discoveries
 
-- Observation: None yet.
-  Evidence: Migration not started at plan creation time.
+- Observation: Running `node .\\yfsp\\test_yfsp_analyzer.js` fails because the test file expects a test runner that provides `describe` (likely Mocha).
+  Evidence: `ReferenceError: describe is not defined` from Node.js v24.12.0.
 
 ## Decision Log
 
@@ -32,9 +32,15 @@ After this change, there will be one Git repository that contains all three Java
   Rationale: This keeps the full commit history while producing a clear monorepo folder structure.
   Date/Author: 2026-02-06 / Codex
 
+- Decision: Use Git structural validation plus history containment checks as acceptance, and record the current test-runner gap for `yfsp`.
+  Rationale: The repository does not currently define a runnable automated test command for the Mocha-style file; migration correctness can still be proven by subtree merge ancestry and file presence checks.
+  Date/Author: 2026-02-06 / Codex
+
 ## Outcomes & Retrospective
 
-Pending implementation.
+The monorepo was created successfully at `c:/Github/js-scripts-monorepo` and now includes the three projects under `Golden-Left-Right`, `StreamBoost`, and `yfsp`. Subtree imports preserved history, verified by branch containment checks showing `main` contains `golden/main`, `streamboost/main`, and `yfsp/main`.
+
+The top-level `README.md` now documents the consolidation result and verification commands. A residual gap remains around formal test execution for `yfsp`, where a Mocha-style test file exists but no project-level test runner command is configured in this migration.
 
 ## Context and Orientation
 
@@ -107,7 +113,38 @@ The migration is safe to retry by deleting `c:/Github/js-scripts-monorepo` and r
 
 ## Artifacts and Notes
 
-Evidence snippets will be appended after each milestone with short command outputs that prove imports and history preservation.
+Evidence snippets proving imports and history preservation:
+
+    PS c:\Github\js-scripts-monorepo> Get-ChildItem -Name
+    .agent
+    Golden-Left-Right
+    StreamBoost
+    yfsp
+    README.md
+
+    PS c:\Github\js-scripts-monorepo> git branch --contains golden/main
+    * main
+
+    PS c:\Github\js-scripts-monorepo> git branch --contains streamboost/main
+    * main
+
+    PS c:\Github\js-scripts-monorepo> git branch --contains yfsp/main
+    * main
+
+    PS c:\Github\js-scripts-monorepo> git log --oneline --graph --decorate --max-count=12
+    *   2b6d658 (HEAD -> main) Add 'yfsp/' from commit 'd2617f817397af5bbc8fd5802cc0298a74a8cd9b'
+    |\
+    | * d2617f8 (yfsp/main, yfsp/HEAD) 11
+    *   88e64b1 Add 'StreamBoost/' from commit '8cb3664d746c4559f471a3242b469ee7c4d1c48e'
+    |\
+    | * 8cb3664 (streamboost/main, streamboost/HEAD) Update StreamBoost.js
+    *   b3ae182 Add 'Golden-Left-Right/' from commit '735e402178cf89884f11cc72acea7428c6ee52a5'
+    |\
+    | * 735e402 (golden/main, golden/HEAD) Update Golden-Left-Right.js
+    * 71457dd chore: add consolidation exec plan
+
+    PS c:\Github\js-scripts-monorepo> node .\yfsp\test_yfsp_analyzer.js
+    ReferenceError: describe is not defined
 
 ## Interfaces and Dependencies
 
@@ -116,3 +153,5 @@ This work depends on standard Git commands and `git subtree`. No new runtime dep
 `c:/Github/js-scripts-monorepo/Golden-Left-Right`
 `c:/Github/js-scripts-monorepo/StreamBoost`
 `c:/Github/js-scripts-monorepo/yfsp`
+
+Revision Note (2026-02-06): Updated this plan after implementation to mark completed milestones, record validation artifacts, and document the test-runner discovery for `yfsp`.
