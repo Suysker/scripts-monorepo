@@ -1,4 +1,4 @@
-// ==UserScript==
+﻿// ==UserScript==
 // @name         YFSP.TV Unlocker
 // @namespace    http://tampermonkey.net/
 // @version      1.1
@@ -8,8 +8,8 @@
 // @match        *://*.dudupro.com/*
 // @run-at       document-start
 // @grant        unsafeWindow
-// @homepage     https://github.com/Suysker/js-scripts-monorepo/tree/main/yfsp
-// @supportURL   https://github.com/Suysker/js-scripts-monorepo/issues
+// @homepage     https://github.com/Suysker/scripts-monorepo/tree/main/yfsp
+// @supportURL   https://github.com/Suysker/scripts-monorepo/issues
 // ==/UserScript==
 
 (function() {
@@ -604,3 +604,4 @@
     setInterval(bootstrap, 2000);
 
 })();
+

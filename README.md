@@ -2,9 +2,9 @@
 
 > **一个仓库管理多套浏览器脚本：视频快捷控制、流媒体缓冲增强、YFSP 页面解锁增强。**
 
-![License](https://img.shields.io/github/license/Suysker/js-scripts-monorepo?style=flat-square) ![Repo](https://img.shields.io/badge/Repo-Monorepo-blue?style=flat-square) ![Language](https://img.shields.io/badge/Language-JavaScript-yellow?style=flat-square)
+![License](https://img.shields.io/github/license/Suysker/scripts-monorepo?style=flat-square) ![Repo](https://img.shields.io/badge/Repo-Monorepo-blue?style=flat-square) ![Language](https://img.shields.io/badge/Language-JavaScript-yellow?style=flat-square)
 
-GitHub：`https://github.com/Suysker/js-scripts-monorepo`
+GitHub：`https://github.com/Suysker/scripts-monorepo`
 
 ---
 
@@ -33,11 +33,11 @@ GitHub：`https://github.com/Suysker/js-scripts-monorepo`
 ## ⚡ 快速安装（Raw）
 
 - Golden-Left-Right
-  `https://raw.githubusercontent.com/Suysker/js-scripts-monorepo/main/Golden-Left-Right/Golden-Left-Right.js`
+  `https://raw.githubusercontent.com/Suysker/scripts-monorepo/main/Golden-Left-Right/Golden-Left-Right.js`
 - StreamBoost
-  `https://raw.githubusercontent.com/Suysker/js-scripts-monorepo/main/StreamBoost/StreamBoost.js`
+  `https://raw.githubusercontent.com/Suysker/scripts-monorepo/main/StreamBoost/StreamBoost.js`
 - YFSP Unlocker
-  `https://raw.githubusercontent.com/Suysker/js-scripts-monorepo/main/yfsp/yfsp-unlocker.js`
+  `https://raw.githubusercontent.com/Suysker/scripts-monorepo/main/yfsp/yfsp-unlocker.js`
 
 使用前提：浏览器已安装 **Tampermonkey** 或兼容脚本管理器。
 
@@ -56,8 +56,8 @@ yfsp/
 
 ## 🤝 反馈与贡献
 
-- Issues：`https://github.com/Suysker/js-scripts-monorepo/issues`
-- Pull Requests：`https://github.com/Suysker/js-scripts-monorepo/pulls`
+- Issues：`https://github.com/Suysker/scripts-monorepo/issues`
+- Pull Requests：`https://github.com/Suysker/scripts-monorepo/pulls`
 
 如果你希望新增脚本或做统一配置，也建议在 Issue 里先提需求。
 
@@ -66,3 +66,4 @@ yfsp/
 ## 📄 许可协议
 
 本仓库使用 [MIT License](./LICENSE)。
+

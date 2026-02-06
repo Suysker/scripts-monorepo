@@ -1,8 +1,8 @@
-# 黄金左右键 🚀
+﻿# 黄金左右键 🚀
 
 > **按住"→"键倍速播放，按住"←"键减速播放，松开恢复原来的倍速，轻松追剧，看视频更灵活，还能快进/跳过大部分网站的广告！**
 
-![License](https://img.shields.io/github/license/Suysker/js-scripts-monorepo?style=flat-square) ![Downloads](https://img.shields.io/greasyfork/dt/507274?style=flat-square) ![Version](https://img.shields.io/greasyfork/v/507274?style=flat-square) ![Tampermonkey](https://img.shields.io/badge/Tampermonkey-5.1.1-red.svg?style=popout-square) ![Tampermonkey](https://img.shields.io/badge/Tampermonkey-Beta-red.svg?style=popout-square)
+![License](https://img.shields.io/github/license/Suysker/scripts-monorepo?style=flat-square) ![Downloads](https://img.shields.io/greasyfork/dt/507274?style=flat-square) ![Version](https://img.shields.io/greasyfork/v/507274?style=flat-square) ![Tampermonkey](https://img.shields.io/badge/Tampermonkey-5.1.1-red.svg?style=popout-square) ![Tampermonkey](https://img.shields.io/badge/Tampermonkey-Beta-red.svg?style=popout-square)
 
 ------
 
@@ -10,7 +10,7 @@
 
 - [Monorepo 根目录](../)
 - [当前项目目录](./)
-- [GitHub 仓库](https://github.com/Suysker/js-scripts-monorepo)
+- [GitHub 仓库](https://github.com/Suysker/scripts-monorepo)
 
 ------
 
@@ -57,7 +57,7 @@
 4. 当遇到冗长片段或广告时，可以**同时按下左右键（← + →）** 快进视频，快速跳过不必要的内容。
 
 脚本源码地址（Raw）：
-`https://raw.githubusercontent.com/Suysker/js-scripts-monorepo/main/Golden-Left-Right/Golden-Left-Right.js`
+`https://raw.githubusercontent.com/Suysker/scripts-monorepo/main/Golden-Left-Right/Golden-Left-Right.js`
 
 ------
 
@@ -73,9 +73,10 @@
 
 - [Monorepo 根目录](../) 提交 Issue / PR
 - [当前项目目录](./) 查看此项目代码
-- [GitHub Issues](https://github.com/Suysker/js-scripts-monorepo/issues)
+- [GitHub Issues](https://github.com/Suysker/scripts-monorepo/issues)
 - [Greasy Fork 页面](https://greasyfork.org/zh-CN/scripts/507274) 提供反馈
 
 ------
 
 **设计初衷是为用户提供更加灵活、快速的视频观看体验，让您能够轻松控制视频播放！** 🎬
+

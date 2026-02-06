@@ -1,4 +1,4 @@
-// ==UserScript==
+﻿// ==UserScript==
 // @name         流媒体加速缓冲
 // @namespace    streamboost
 // @icon         https://image.suysker.xyz/i/2023/10/09/artworks-QOnSW1HR08BDMoe9-GJTeew-t500x500.webp
@@ -9,8 +9,8 @@
 // @run-at       document-start
 // @grant        GM_registerMenuCommand
 // @grant        GM_addElement
-// @homepage     https://github.com/Suysker/js-scripts-monorepo/tree/main/StreamBoost
-// @supportURL   https://github.com/Suysker/js-scripts-monorepo/issues
+// @homepage     https://github.com/Suysker/scripts-monorepo/tree/main/StreamBoost
+// @supportURL   https://github.com/Suysker/scripts-monorepo/issues
 // ==/UserScript==
 
 (() => {
@@ -936,3 +936,4 @@
     }
   }).observe(document.documentElement, { childList: true, subtree: true });
 })();
+

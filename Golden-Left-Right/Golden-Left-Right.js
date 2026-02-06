@@ -1,4 +1,4 @@
-// ==UserScript==
+﻿// ==UserScript==
 // @name         黄金左右键
 // @description  按住"→"键倍速播放，按住"←"键减速播放，松开恢复原来的倍速，轻松追剧，看视频更灵活，还能快进/跳过大部分网站的广告！~ 支持用户单独配置倍速和秒数，并可根据根域名启用或禁用脚本
 // @icon         https://image.suysker.xyz/i/2023/10/09/artworks-QOnSW1HR08BDMoe9-GJTeew-t500x500.webp
@@ -10,8 +10,8 @@
 // @grant        GM_registerMenuCommand
 // @grant        GM_setValue
 // @grant        GM_getValue
-// @homepage     https://github.com/Suysker/js-scripts-monorepo/tree/main/Golden-Left-Right
-// @supportURL   https://github.com/Suysker/js-scripts-monorepo/issues
+// @homepage     https://github.com/Suysker/scripts-monorepo/tree/main/Golden-Left-Right
+// @supportURL   https://github.com/Suysker/scripts-monorepo/issues
 // ==/UserScript==
 
 (function () {
@@ -546,3 +546,4 @@
     // Execute the initialization
     init();
 })();
+
