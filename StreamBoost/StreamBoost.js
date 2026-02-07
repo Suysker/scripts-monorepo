@@ -3,7 +3,7 @@
 // @namespace    streamboost
 // @icon         https://image.suysker.xyz/i/2023/10/09/artworks-QOnSW1HR08BDMoe9-GJTeew-t500x500.webp
 // @namespace    http://tampermonkey.net/
-// @version      1.0.2
+// @version      1.1.2
 // @description  通用流媒体加速：加大缓冲、并发预取、内存命中、在途合并、按站点启停、修复部分站点自定义 Loader 导致的串行；当前覆盖 HLS.js，后续可扩展至其它播放器/协议。
 // @match        *://*/*
 // @run-at       document-start
@@ -12,70 +12,215 @@
 // @homepage     https://github.com/Suysker/scripts-monorepo/tree/main/StreamBoost
 // @supportURL   https://github.com/Suysker/scripts-monorepo/issues
 // ==/UserScript==
-
 (() => {
   'use strict';
-
-  // ====== 本地存储键 ======
-  const LS_MASTER_KEY   = 'HLS_BIGBUF_ENABLE';     // "1"=全局开（默认）
-  const LS_DEBUG_KEY    = 'HLS_BIGBUF_DEBUG';      // "1"=开
-  const LS_PREFETCH_KEY = 'HLS_BIGBUF_PREFETCH';   // "1"=开
-  const LS_CACHE_KEY    = 'HLS_BIGBUF_CACHE';      // "1"=开
-  const LS_BLOCKLIST    = 'HLS_BIGBUF_BLOCKLIST';  // JSON 数组：['example.com','*.foo.com']
-
-  // ====== 站点黑名单 ======
-  function readBlocklist() {
-    try {
-      const raw = localStorage.getItem(LS_BLOCKLIST);
-      const arr = raw ? JSON.parse(raw) : [];
-      return Array.isArray(arr) ? arr.filter(x => typeof x === 'string' && x.trim()) : [];
-    } catch { return []; }
-  }
-  function writeBlocklist(list) {
-    try { localStorage.setItem(LS_BLOCKLIST, JSON.stringify(list)); } catch {}
-  }
+  const LS_MASTER_KEY               = 'HLS_BIGBUF_ENABLE';               // "1"=全局开（默认）
+  const LS_DEBUG_KEY                = 'HLS_BIGBUF_DEBUG';                // "1"=开
+  const LS_PREFETCH_KEY             = 'HLS_BIGBUF_PREFETCH';             // "1"=开
+  const LS_CACHE_KEY                = 'HLS_BIGBUF_CACHE';                // "1"=开
+  const LS_BLOCKLIST                = 'HLS_BIGBUF_BLOCKLIST';            // JSON 数组：['example.com','*.foo.com']
+  const LS_PREFETCH_AHEAD_KEY       = 'HLS_BIGBUF_PREFETCH_AHEAD';
+  const LS_CONC_GLOBAL_KEY          = 'HLS_BIGBUF_CONC_GLOBAL';
+  const LS_CONC_PER_ORIGIN_KEY      = 'HLS_BIGBUF_CONC_PER_ORIGIN';
+  const LS_PREFETCH_TIMEOUT_MS_KEY  = 'HLS_BIGBUF_PREFETCH_TIMEOUT_MS';
+  const LS_WAIT_INFLIGHT_MS_KEY     = 'HLS_BIGBUF_WAIT_INFLIGHT_MS';
+  const LS_PREFETCH_STRATEGY_KEY    = 'HLS_BIGBUF_PREFETCH_STRATEGY';
+  const LS_VOD_BUFFER_SEC_KEY       = 'HLS_BIGBUF_VOD_BUFFER_SEC';
+  const LS_BACK_BUFFER_SEC_KEY      = 'HLS_BIGBUF_BACK_BUFFER_SEC';
+  const LS_MAX_MAX_BUFFER_SEC_KEY   = 'HLS_BIGBUF_MAX_MAX_BUFFER_SEC';
+  const LS_MAX_MEM_MB_KEY           = 'HLS_BIGBUF_MAX_MEM_MB';
+  const DEFAULT_VOD_BUFFER_SEC = (navigator.deviceMemory && navigator.deviceMemory < 4) ? 180 : 600;
+  const PREFETCH_STRATEGIES = Object.freeze([
+    { value: 'xhr-hls-fetch', label: 'xhr-hls-fetch（推荐）' },
+    { value: 'hls-xhr-fetch', label: 'hls-xhr-fetch' },
+    { value: 'hls-only', label: 'hls-only' },
+    { value: 'xhr-only', label: 'xhr-only' },
+    { value: 'fetch-only', label: 'fetch-only' },
+    { value: 'fetch-xhr-hls', label: 'fetch-xhr-hls' }
+  ]);
+  function readLS(key, fallback = '') { try { const raw = localStorage.getItem(key); return raw == null ? fallback : raw; } catch { return fallback; } }
+  function writeLS(key, value) { try { if (value == null) localStorage.removeItem(key); else localStorage.setItem(key, String(value)); } catch {} }
+  function clampInt(value, min, max) { let out = Number.isFinite(value) ? Math.round(value) : 0; if (Number.isFinite(min)) out = Math.max(min, out); if (Number.isFinite(max)) out = Math.min(max, out); return out; }
+  function readBoolSetting(key, defaultOn = false) { return readLS(key, defaultOn ? '1' : '') === '1'; }
+  function writeBoolSetting(key, enabled) { writeLS(key, enabled ? '1' : ''); }
+  function readIntSetting(key, fallback, min, max) { const raw = String(readLS(key, '')).trim(); if (!raw) return fallback; const num = Number(raw); return Number.isFinite(num) ? clampInt(num, min, max) : fallback; }
+  function readStringSetting(key, fallback, allowedValues) { const raw = String(readLS(key, '')).trim(); return raw && allowedValues.includes(raw) ? raw : fallback; }
   function normHost(host) { return String(host || '').trim().toLowerCase(); }
-  function hostMatches(host, pattern) {
-    host    = normHost(host);
-    pattern = normHost(pattern);
-    if (!host || !pattern) return false;
-    if (pattern.startsWith('*.')) {
-      const suf = pattern.slice(2);
-      return host === suf || host.endsWith('.' + suf);
+  function readBlocklist() { try { const arr = JSON.parse(localStorage.getItem(LS_BLOCKLIST) || '[]'); return Array.isArray(arr) ? arr.filter(x => typeof x === 'string' && x.trim()) : []; } catch { return []; } }
+  function writeBlocklist(list) { try { localStorage.setItem(LS_BLOCKLIST, JSON.stringify(list)); } catch {} }
+  function hostMatches(host, pattern) { host = normHost(host); pattern = normHost(pattern); if (!host || !pattern) return false; if (pattern.startsWith('*.')) { const suf = pattern.slice(2); return host === suf || host.endsWith('.' + suf); } return host === pattern; }
+  function isBlockedForURL(url) { try { const host = new URL(url, location.href).hostname; return !readBoolSetting(LS_MASTER_KEY, true) || readBlocklist().some(p => hostMatches(host, p)); } catch { return false; } }
+  function isBlockedForDoc(doc) { try { return isBlockedForURL(doc?.location?.href || doc?.URL || ''); } catch { return false; } }
+  const SB_CFG_MODAL_ID = 'hls-bigbuf-config-modal';
+  const SB_CFG_STYLE_ID = 'hls-bigbuf-config-style';
+  const DEFAULT_MAX_MEM_MB = (navigator.deviceMemory >= 8) ? 192 : (navigator.deviceMemory >= 4 ? 128 : 64);
+  const CONFIG_FIELDS = [
+    { group: '预取并发', type: 'number', key: LS_PREFETCH_AHEAD_KEY, label: '预取前瞻片段数', def: 12, min: 0, max: 60, step: 1 },
+    { group: '预取并发', type: 'number', key: LS_CONC_GLOBAL_KEY, label: '全局并发上限', def: 4, min: 1, max: 16, step: 1 },
+    { group: '预取并发', type: 'number', key: LS_CONC_PER_ORIGIN_KEY, label: '单 Origin 并发上限', def: 4, min: 1, max: 16, step: 1 },
+    { group: '预取并发', type: 'number', key: LS_WAIT_INFLIGHT_MS_KEY, label: '在途复用等待（ms）', def: 500, min: 0, max: 10000, step: 50 },
+    { group: '缓冲与内存', type: 'number', key: LS_VOD_BUFFER_SEC_KEY, label: 'VOD 前向缓冲（秒）', def: DEFAULT_VOD_BUFFER_SEC, min: 60, max: 3600, step: 30 },
+    { group: '缓冲与内存', type: 'number', key: LS_BACK_BUFFER_SEC_KEY, label: '回看缓冲（秒）', def: 180, min: 0, max: 1800, step: 30 },
+    { group: '缓冲与内存', type: 'number', key: LS_MAX_MAX_BUFFER_SEC_KEY, label: '最大缓冲上限（秒）', def: 1800, min: 120, max: 7200, step: 60 },
+    { group: '缓冲与内存', type: 'number', key: LS_MAX_MEM_MB_KEY, label: 'LRU 内存上限（MB）', def: DEFAULT_MAX_MEM_MB, min: 16, max: 512, step: 8 },
+    { group: '请求策略+常规开关', type: 'bool', key: LS_PREFETCH_KEY, label: '并发预取', def: true },
+    { group: '请求策略+常规开关', type: 'bool', key: LS_CACHE_KEY, label: '内存命中 fLoader', def: true },
+    { group: '请求策略+常规开关', type: 'number', key: LS_PREFETCH_TIMEOUT_MS_KEY, label: '预取超时（ms）', def: 15000, min: 1000, max: 120000, step: 500 },
+    { group: '请求策略+常规开关', type: 'choice', key: LS_PREFETCH_STRATEGY_KEY, label: '预取策略', def: 'xhr-hls-fetch', options: PREFETCH_STRATEGIES }
+  ];
+  function ensureConfigStyle() {
+    if (document.getElementById(SB_CFG_STYLE_ID)) return;
+    const style = document.createElement('style');
+    style.id = SB_CFG_STYLE_ID;
+    style.textContent = `#${SB_CFG_MODAL_ID}{position:fixed;inset:0;z-index:2147483647;background:radial-gradient(1200px 520px at 8% -6%,rgba(255,212,229,.38),transparent 66%),radial-gradient(980px 520px at 100% 100%,rgba(233,232,236,.44),transparent 67%),rgba(245,240,243,.74);display:flex;align-items:center;justify-content:center;font:12px/1.3 "Segoe UI","PingFang SC","Microsoft YaHei",sans-serif;color:#4a4350}#${SB_CFG_MODAL_ID} .panel{width:min(1260px,96vw);max-height:min(92vh,760px);display:grid;grid-template-rows:auto auto;gap:10px;padding:14px;border-radius:20px;border:1px solid #f0d6e2;background:linear-gradient(145deg,rgba(255,255,255,.96),rgba(244,238,242,.95));box-shadow:0 16px 40px rgba(104,88,99,.22),inset 0 1px 0 rgba(255,255,255,.9)}#${SB_CFG_MODAL_ID} h2{margin:0;font-size:22px;color:#544a56}#${SB_CFG_MODAL_ID} .head{display:flex;justify-content:space-between;align-items:flex-start;gap:10px;flex-wrap:wrap}#${SB_CFG_MODAL_ID} .hint{margin:4px 0 0;color:#7b6f7c}#${SB_CFG_MODAL_ID} .layout{display:grid;grid-template-columns:1fr;gap:8px}#${SB_CFG_MODAL_ID} .sections{display:grid;grid-template-columns:repeat(3,minmax(220px,1fr));gap:8px}#${SB_CFG_MODAL_ID} .group{background:linear-gradient(150deg,rgba(255,255,255,.98),rgba(247,242,245,.96));border:1px solid #ecdde6;border-radius:12px;padding:8px}#${SB_CFG_MODAL_ID} .group h3{margin:0 0 6px;font-size:13px;color:#5f5462}#${SB_CFG_MODAL_ID} .group-grid{display:grid;grid-template-columns:1fr;gap:6px}#${SB_CFG_MODAL_ID} .field{background:#fff;border:1px solid #efe4eb;border-radius:10px;padding:7px;box-shadow:inset 0 1px 0 rgba(255,255,255,.9)}#${SB_CFG_MODAL_ID} .title{font-size:11px;color:#5f5463;margin-bottom:5px}#${SB_CFG_MODAL_ID} .num{display:grid;grid-template-columns:1fr 72px;gap:6px;align-items:center}#${SB_CFG_MODAL_ID} input[type=number]{width:100%;box-sizing:border-box;border:1px solid #dcced7;border-radius:7px;padding:5px 6px;font-size:12px;color:#4a4150;background:#fefcfd;text-align:center}#${SB_CFG_MODAL_ID} input[type=range]{width:100%;accent-color:#d88cae}#${SB_CFG_MODAL_ID} .chips{display:flex;gap:5px;flex-wrap:wrap}#${SB_CFG_MODAL_ID} .chip{border:1px solid #dcc6d2;background:#f8f3f6;color:#5f5562;border-radius:999px;padding:4px 7px;cursor:pointer;font-size:11px}#${SB_CFG_MODAL_ID} .chip.on{background:linear-gradient(135deg,#f6cde0,#f2b8d3);border-color:#df99bc;color:#4d3544}#${SB_CFG_MODAL_ID} .actions{display:flex;justify-content:flex-end;gap:8px}#${SB_CFG_MODAL_ID} .head .actions{margin-left:auto}#${SB_CFG_MODAL_ID} button{border:1px solid #dccad5;border-radius:9px;padding:7px 12px;cursor:pointer;font-weight:700;color:#5d4f60;background:#faf6f8}#${SB_CFG_MODAL_ID} button.primary{background:linear-gradient(135deg,#f7d2e3,#f2bad4);border-color:#de9dbe;color:#4f3c49}#${SB_CFG_MODAL_ID} .switch{display:flex;gap:6px;flex-wrap:wrap}#${SB_CFG_MODAL_ID} .switch-btn{border:1px solid #dcc6d2;background:#f8f3f6;color:#5f5562;border-radius:999px;padding:4px 10px;cursor:pointer;font-size:11px}#${SB_CFG_MODAL_ID} .switch-btn.on{background:linear-gradient(135deg,#f6cde0,#f2b8d3);border-color:#df99bc;color:#4d3544}`;
+    (document.head || document.documentElement).appendChild(style);
+  }
+  function readFieldValue(field) {
+    if (field.type === 'bool') return readBoolSetting(field.key, !!field.def);
+    if (field.type === 'number') return readIntSetting(field.key, field.def, field.min, field.max);
+    if (field.type === 'choice') return readStringSetting(field.key, field.def, (field.options || []).map(x => x.value));
+    return '';
+  }
+  function setDefaultValue(field, input) {
+    if (!input) return;
+    if (field.type === 'bool') {
+      for (const b of input.buttons) b.classList.toggle('on', b.dataset.value === (field.def ? '1' : '0'));
+    } else if (field.type === 'number') { input.range.value = String(field.def); input.num.value = String(field.def); }
+    else for (const b of input.buttons) b.classList.toggle('on', b.dataset.value === field.def);
+  }
+  function saveFieldValue(field, input) {
+    if (!input) return;
+    if (field.type === 'bool') {
+      const on = input.buttons.find(b => b.classList.contains('on'));
+      const val = String(on?.dataset?.value || '0') === '1';
+      writeBoolSetting(field.key, val);
+      return;
+    } else if (field.type === 'number') {
+      const raw = String(input.num.value || '').trim();
+      if (!raw) { writeLS(field.key, null); input.num.value = String(field.def); input.range.value = String(field.def); return; }
+      const num = Number(raw);
+      if (!Number.isFinite(num)) throw new Error(`${field.label} 必须是数字`);
+      const normalized = String(clampInt(num, field.min, field.max));
+      input.num.value = normalized;
+      input.range.value = normalized;
+      writeLS(field.key, normalized);
+      return;
     }
-    return host === pattern;
+    if (field.type === 'choice') {
+      const on = input.buttons.find(b => b.classList.contains('on'));
+      const val = String(on?.dataset?.value || '').trim();
+      const allowed = (field.options || []).map(x => x.value);
+      if (!allowed.includes(val)) throw new Error(`${field.label} 取值无效`);
+      writeLS(field.key, val);
+      return;
+    }
+    throw new Error('不支持的字段类型');
   }
-  function isBlockedForURL(url) {
-    try {
-      const u = new URL(url, location.href);
-      const host = u.hostname;
-      const masterOn = (localStorage.getItem(LS_MASTER_KEY) ?? '1') === '1';
-      if (!masterOn) return true; // 全局关闭
-      const bl = readBlocklist();
-      return bl.some(p => hostMatches(host, p));
-    } catch { return false; }
+  function openConfigPanel() {
+    if (!document.body) { alert('页面尚未加载完成，请稍后重试。'); return; }
+    ensureConfigStyle();
+    document.getElementById(SB_CFG_MODAL_ID)?.remove();
+    const modal = document.createElement('div');
+    modal.id = SB_CFG_MODAL_ID;
+    modal.innerHTML = '<div class="panel"><div class="head"><div><h2>⚙️ StreamBoost 参数配置</h2><p class="hint">此页用于调整常用开关与进阶参数，保存后刷新页面生效。</p></div><div class="actions"><button data-act="close">关闭</button><button data-act="reset">恢复默认</button><button class="primary" data-act="save">保存配置</button></div></div><div class="layout"><div class="sections" data-zone="sections"></div></div></div>';
+    const controls = new Map();
+    const sectionsZone = modal.querySelector('[data-zone="sections"]');
+    const groups = new Map();
+    for (const field of CONFIG_FIELDS) {
+      let groupGrid = groups.get(field.group);
+      if (!groupGrid) {
+        const group = document.createElement('section');
+        group.className = 'group';
+        group.innerHTML = `<h3>${field.group}</h3><div class="group-grid"></div>`;
+        sectionsZone.appendChild(group);
+        groupGrid = group.querySelector('.group-grid');
+        groups.set(field.group, groupGrid);
+      }
+      const row = document.createElement('div');
+      row.className = 'field';
+      row.innerHTML = `<div class="title">${field.label}</div>`;
+      let input = null;
+      if (field.type === 'bool') {
+        const wrap = document.createElement('div');
+        wrap.className = 'switch';
+        const buttons = [];
+        [
+          { value: '1', label: '启用' },
+          { value: '0', label: '停用' }
+        ].forEach(opt => {
+          const btn = document.createElement('button');
+          btn.type = 'button';
+          btn.className = 'switch-btn';
+          btn.textContent = opt.label;
+          btn.dataset.value = opt.value;
+          btn.addEventListener('click', () => { for (const b of buttons) b.classList.remove('on'); btn.classList.add('on'); });
+          buttons.push(btn);
+          wrap.appendChild(btn);
+        });
+        row.appendChild(wrap);
+        input = { buttons };
+      } else if (field.type === 'number') {
+        row.innerHTML += `<div class="num"><input type="range" min="${field.min}" max="${field.max}" step="${field.step || 1}"><input type="number" min="${field.min}" max="${field.max}" step="${field.step || 1}"></div>`;
+        const range = row.querySelector('input[type="range"]');
+        const num = row.querySelector('input[type="number"]');
+        range.addEventListener('input', () => { num.value = range.value; });
+        num.addEventListener('input', () => { const v = Number(num.value); if (Number.isFinite(v)) range.value = String(clampInt(v, field.min, field.max)); });
+        input = { range, num };
+      } else if (field.type === 'choice') {
+        const chips = document.createElement('div');
+        chips.className = 'chips';
+        const buttons = [];
+        for (const op of field.options || []) {
+          const btn = document.createElement('button');
+          btn.type = 'button';
+          btn.className = 'chip';
+          btn.textContent = op.label;
+          btn.dataset.value = op.value;
+          btn.addEventListener('click', () => { for (const b of buttons) b.classList.remove('on'); btn.classList.add('on'); });
+          buttons.push(btn);
+          chips.appendChild(btn);
+        }
+        row.appendChild(chips);
+        input = { buttons };
+      }
+      if (field.type === 'bool') {
+        const val = readFieldValue(field) ? '1' : '0';
+        for (const b of input.buttons) b.classList.toggle('on', b.dataset.value === val);
+      } else if (field.type === 'number') {
+        const val = String(readFieldValue(field));
+        input.range.value = val;
+        input.num.value = val;
+      } else {
+        const val = String(readFieldValue(field));
+        for (const b of input.buttons) b.classList.toggle('on', b.dataset.value === val);
+      }
+      groupGrid.appendChild(row);
+      controls.set(field.key, input);
+    }
+    const close = () => modal.remove();
+    modal.addEventListener('click', (e) => { if (e.target === modal) close(); });
+    modal.querySelector('[data-act="close"]').addEventListener('click', close);
+    modal.querySelector('[data-act="reset"]').addEventListener('click', () => { for (const field of CONFIG_FIELDS) setDefaultValue(field, controls.get(field.key)); });
+    modal.querySelector('[data-act="save"]').addEventListener('click', () => {
+      try {
+        for (const field of CONFIG_FIELDS) saveFieldValue(field, controls.get(field.key));
+        alert('配置已保存，刷新页面生效。');
+        close();
+      } catch (e) {
+        alert(`保存失败：${e?.message || e}`);
+      }
+    });
+    document.body.appendChild(modal);
   }
-  function isBlockedForDoc(doc) {
-    try {
-      const url = doc?.location?.href || doc?.URL || '';
-      return isBlockedForURL(url);
-    } catch { return false; }
-  }
-
-  // ====== 菜单（仅顶层） ======
   if (typeof GM_registerMenuCommand === 'function' && window.top === window) {
-    const isDebug   = localStorage.getItem(LS_DEBUG_KEY)    === '1';
-    const prefetch  = localStorage.getItem(LS_PREFETCH_KEY) ?? '1';
-    const memcache  = localStorage.getItem(LS_CACHE_KEY)    ?? '1';
-    const masterOn  = (localStorage.getItem(LS_MASTER_KEY) ?? '1') === '1';
-    const host      = location.hostname;
-    const blocked   = isBlockedForURL(location.href);
-
+    const isDebug    = readBoolSetting(LS_DEBUG_KEY, false);
+    const masterOn   = readBoolSetting(LS_MASTER_KEY, true);
+    const host       = location.hostname;
+    const blocked    = isBlockedForURL(location.href);
     GM_registerMenuCommand(masterOn ? '🔌 全局状态（当前：启用）' : '🔌 全局状态（当前：停用）', () => {
-      localStorage.setItem(LS_MASTER_KEY, masterOn ? '' : '1');
+      writeBoolSetting(LS_MASTER_KEY, !masterOn);
       alert((!masterOn ? '已启用' : '已停用') + '全局；刷新页面生效');
     });
-
     GM_registerMenuCommand(blocked ? `✅ 在此站点启用（当前：停用 @ ${host})` : `⛔ 在此站点停用（当前：启用 @ ${host})`, () => {
       const bl = readBlocklist();
       const h  = normHost(host);
@@ -90,54 +235,20 @@
         alert(`已对本域名停用：${h}\n刷新页面生效`);
       }
     });
-
-    GM_registerMenuCommand('📝 查看/编辑 站点黑名单（JSON）', () => {
-      const cur = JSON.stringify(readBlocklist(), null, 2);
-      const next = prompt('编辑黑名单（JSON 数组，支持精确主机或通配 *.domain.com）', cur);
-      if (next == null) return;
-      try { writeBlocklist(JSON.parse(next)); alert('已更新黑名单；刷新页面生效'); }
-      catch (e) { alert('更新失败：' + e); }
-    });
-
-    const makeStatusLabel = (icon, name, on) =>
-      `${icon} ${name}（当前：${on ? '启用' : '停用'}）`;
-
+    GM_registerMenuCommand('⚙️ 打开参数配置页', openConfigPanel);
     GM_registerMenuCommand(
-      makeStatusLabel('🐞', 'Debug 日志', isDebug),
+      `🐞 Debug 日志（当前：${isDebug ? '启用' : '停用'}）`,
       () => {
-        const cur  = (localStorage.getItem(LS_DEBUG_KEY) === '1');
+        const cur  = readBoolSetting(LS_DEBUG_KEY, false);
         const next = !cur;
-        localStorage.setItem(LS_DEBUG_KEY, next ? '1' : '');
+        writeBoolSetting(LS_DEBUG_KEY, next);
         alert(`已${next ? '启用' : '停用'} Debug 日志；刷新页面生效`);
       }
     );
-
-    GM_registerMenuCommand(
-      makeStatusLabel('🚀', '并发预取', (prefetch === '1')),
-      () => {
-        const cur  = ((localStorage.getItem(LS_PREFETCH_KEY) ?? '1') === '1');
-        const next = !cur;
-        localStorage.setItem(LS_PREFETCH_KEY, next ? '1' : '');
-        alert(`已${next ? '启用' : '停用'} 并发预取；刷新页面生效`);
-      }
-    );
-
-    GM_registerMenuCommand(
-      makeStatusLabel('🧠', '内存命中 fLoader', (memcache === '1')),
-      () => {
-        const cur  = ((localStorage.getItem(LS_CACHE_KEY) ?? '1') === '1');
-        const next = !cur;
-        localStorage.setItem(LS_CACHE_KEY, next ? '1' : '');
-        alert(`已${next ? '启用' : '停用'} 内存命中 fLoader；刷新页面生效`);
-      }
-    );
   }
-
-  // ====== 注入的脚本 ======
   const PAYLOAD = `
   (function(){
     'use strict';
-
     if (typeof localStorage !== 'undefined') {
       try {
         const DEBUG = (localStorage.getItem('HLS_BIGBUF_DEBUG') === '1');
@@ -150,8 +261,6 @@
         console.info('[HLS BigBuffer] 已激活', location.href, window === window.top ? 'top' : 'iframe');
       }
     } catch {}
-
-    // —— 固定原生实现，绕过站点改写 —— //
     const Native = (() => {
       let XHR   = window.XMLHttpRequest;
       let Fetch = window.fetch ? window.fetch.bind(window) : null;
@@ -173,12 +282,44 @@
       } catch {}
       return { XHR, Fetch, AC };
     })();
-
-    // —— 缓冲策略 —— //
-    const VOD_BUFFER_SEC     = (navigator.deviceMemory && navigator.deviceMemory < 4) ? 180 : 600;
-    const BACK_BUFFER_SEC    = 180;
-    const MAX_MAX_BUFFER_SEC = 1800;
-
+    const PREFETCH_STRATEGY_VALUES = [
+      'xhr-hls-fetch',
+      'hls-xhr-fetch',
+      'hls-only',
+      'xhr-only',
+      'fetch-only',
+      'fetch-xhr-hls'
+    ];
+    function clampInt(value, min, max) {
+      let out = Number.isFinite(value) ? Math.round(value) : 0;
+      if (typeof min === 'number') out = Math.max(min, out);
+      if (typeof max === 'number') out = Math.min(max, out);
+      return out;
+    }
+    function readBoolLS(key, defaultOn) {
+      let raw = null;
+      try { raw = localStorage.getItem(key); } catch {}
+      if (raw == null) return !!defaultOn;
+      return raw === '1';
+    }
+    function readIntLS(key, fallback, min, max) {
+      let raw = '';
+      try { raw = String(localStorage.getItem(key) ?? '').trim(); } catch {}
+      if (!raw) return fallback;
+      const num = Number(raw);
+      if (!Number.isFinite(num)) return fallback;
+      return clampInt(num, min, max);
+    }
+    function readStringLS(key, fallback, allowedValues) {
+      let raw = '';
+      try { raw = String(localStorage.getItem(key) ?? '').trim(); } catch {}
+      if (!raw) return fallback;
+      return allowedValues.includes(raw) ? raw : fallback;
+    }
+    const DEFAULT_VOD_BUFFER_SEC = (navigator.deviceMemory && navigator.deviceMemory < 4) ? 180 : 600;
+    const VOD_BUFFER_SEC     = readIntLS('HLS_BIGBUF_VOD_BUFFER_SEC', DEFAULT_VOD_BUFFER_SEC, 60, 3600);
+    const BACK_BUFFER_SEC    = readIntLS('HLS_BIGBUF_BACK_BUFFER_SEC', 180, 0, 1800);
+    const MAX_MAX_BUFFER_SEC = readIntLS('HLS_BIGBUF_MAX_MAX_BUFFER_SEC', 1800, 120, 7200);
     const SITE_RULES = [];
     function matchHostRule(ruleHost, host) {
       const rh = String(ruleHost || '').toLowerCase().trim();
@@ -197,50 +338,41 @@
       return null;
     }
     const siteRule = pickSiteRule(location.hostname);
-
-    // —— 开关 —— //
-    let ENABLE_PREFETCH = (localStorage.getItem('HLS_BIGBUF_PREFETCH') ?? '1') === '1';
-    let ENABLE_MEMCACHE = (localStorage.getItem('HLS_BIGBUF_CACHE')    ?? '1') === '1';
-    const DEBUG         = (localStorage.getItem('HLS_BIGBUF_DEBUG') === '1');
-
-    // —— 预取参数 —— //
-    let PREFETCH_AHEAD           = 12;
-    let PREFETCH_CONC_GLOBAL     = +(localStorage.getItem('HLS_BIGBUF_CONC_GLOBAL')     || 4);
-    let PREFETCH_CONC_PER_ORIGIN = +(localStorage.getItem('HLS_BIGBUF_CONC_PER_ORIGIN') || 4);
-    let PREFETCH_TIMEOUT_MS      = 15000;
-    let WAIT_INFLIGHT_MS         = 500;
-    let PREFETCH_STRATEGY        = 'xhr-hls-fetch';
-
+    let ENABLE_PREFETCH = readBoolLS('HLS_BIGBUF_PREFETCH', true);
+    let ENABLE_MEMCACHE = readBoolLS('HLS_BIGBUF_CACHE', true);
+    const DEBUG         = readBoolLS('HLS_BIGBUF_DEBUG', false);
+    let PREFETCH_AHEAD           = readIntLS('HLS_BIGBUF_PREFETCH_AHEAD', 12, 0, 60);
+    let PREFETCH_CONC_GLOBAL     = readIntLS('HLS_BIGBUF_CONC_GLOBAL', 4, 1, 16);
+    let PREFETCH_CONC_PER_ORIGIN = readIntLS('HLS_BIGBUF_CONC_PER_ORIGIN', 4, 1, 16);
+    let PREFETCH_TIMEOUT_MS      = readIntLS('HLS_BIGBUF_PREFETCH_TIMEOUT_MS', 15000, 1000, 120000);
+    let WAIT_INFLIGHT_MS         = readIntLS('HLS_BIGBUF_WAIT_INFLIGHT_MS', 500, 0, 10000);
+    let PREFETCH_STRATEGY        = readStringLS('HLS_BIGBUF_PREFETCH_STRATEGY', 'xhr-hls-fetch', PREFETCH_STRATEGY_VALUES);
     if (siteRule) {
       if (typeof siteRule.prefetch === 'boolean') ENABLE_PREFETCH = siteRule.prefetch;
       if (typeof siteRule.memcache === 'boolean') ENABLE_MEMCACHE = siteRule.memcache;
-      if (typeof siteRule.prefetchStrategy === 'string') PREFETCH_STRATEGY = siteRule.prefetchStrategy;
-      if (typeof siteRule.prefetchAhead === 'number') PREFETCH_AHEAD = Math.max(0, siteRule.prefetchAhead | 0);
-      if (typeof siteRule.prefetchConcGlobal === 'number') PREFETCH_CONC_GLOBAL = Math.max(1, siteRule.prefetchConcGlobal | 0);
-      if (typeof siteRule.prefetchConcPerOrigin === 'number') PREFETCH_CONC_PER_ORIGIN = Math.max(1, siteRule.prefetchConcPerOrigin | 0);
-      if (typeof siteRule.prefetchTimeoutMs === 'number') PREFETCH_TIMEOUT_MS = Math.max(1000, siteRule.prefetchTimeoutMs | 0);
-      if (typeof siteRule.waitInflightMs === 'number') WAIT_INFLIGHT_MS = Math.max(0, siteRule.waitInflightMs | 0);
+      if (typeof siteRule.prefetchStrategy === 'string' && PREFETCH_STRATEGY_VALUES.includes(siteRule.prefetchStrategy)) {
+        PREFETCH_STRATEGY = siteRule.prefetchStrategy;
+      }
+      if (typeof siteRule.prefetchAhead === 'number') PREFETCH_AHEAD = clampInt(siteRule.prefetchAhead, 0, 60);
+      if (typeof siteRule.prefetchConcGlobal === 'number') PREFETCH_CONC_GLOBAL = clampInt(siteRule.prefetchConcGlobal, 1, 16);
+      if (typeof siteRule.prefetchConcPerOrigin === 'number') PREFETCH_CONC_PER_ORIGIN = clampInt(siteRule.prefetchConcPerOrigin, 1, 16);
+      if (typeof siteRule.prefetchTimeoutMs === 'number') PREFETCH_TIMEOUT_MS = clampInt(siteRule.prefetchTimeoutMs, 1000, 120000);
+      if (typeof siteRule.waitInflightMs === 'number') WAIT_INFLIGHT_MS = clampInt(siteRule.waitInflightMs, 0, 10000);
     }
-
-    // —— 失败节流/熔断 —— //
     const FAIL_TTL_MS      = 45000;
     const ORIGIN_BAN_MS    = 10 * 60 * 1000;
     const originFailCount  = new Map();
     const originBanUntil   = new Map();
-
-    // —— LRU 内存上限（自适应）—— //
-    const MAX_MEM_MB = (()=>{
+    const DEFAULT_MAX_MEM_MB = (()=> {
       const dm = navigator.deviceMemory || 4;
       if (dm >= 8) return 192;
       if (dm >= 4) return 128;
       return 64;
     })();
+    const MAX_MEM_MB = readIntLS('HLS_BIGBUF_MAX_MEM_MB', DEFAULT_MAX_MEM_MB, 16, 512);
     const MAX_MEM_BYTES = MAX_MEM_MB * 1024 * 1024;
-
     const log  = (...a)=>{ if (DEBUG) console.log('[HLS BigBuffer]', ...a); };
     const warn = (...a)=>{ console.warn('[HLS BigBuffer]', ...a); };
-
-    // ====== ArrayBuffer 安全工具（修复点：全部走“副本”）======
     function cloneAB(input) {
       if (!input) return null;
       if (input instanceof ArrayBuffer) return input.slice(0);
@@ -261,11 +393,8 @@
       if (ArrayBuffer.isView(buf))    return buf.byteLength || 0;
       return 0;
     }
-
-    // ====== LRU: url -> ArrayBuffer（始终保存“私有副本”，命中返回“消费副本”）======
     const prebuf = new Map();
     let prebufBytes = 0;
-
     function lruGet(url){
       const stored = prebuf.get(url);
       if (!stored) return null;
@@ -273,32 +402,25 @@
         prebuf.delete(url);
         return null;
       }
-      // LRU 触碰
       prebuf.delete(url); prebuf.set(url, stored);
-      // 返回消费副本（交给 Hls.js/Worker 随便转移）
       return cloneAB(stored);
     }
-
     function lruSet(url, buf){
       const copy = cloneAB(buf);
       const size = abSize(copy);
       if (!size || size > MAX_MEM_BYTES) return;
-
       if (prebuf.has(url)) {
         prebufBytes -= (abSize(prebuf.get(url)) || 0);
         prebuf.delete(url);
       }
       prebuf.set(url, copy);
       prebufBytes += size;
-
       while (prebufBytes > MAX_MEM_BYTES && prebuf.size) {
         const [k, v] = prebuf.entries().next().value;
         prebuf.delete(k); prebufBytes -= (abSize(v) || 0);
       }
     }
     function lruHas(url){ return prebuf.has(url); }
-
-    // ====== 在途/元数据 ======
     const inflightMap  = new Map(); // url -> Promise<ArrayBuffer|null>
     const inflightMeta = new Map(); // url -> { controller, level, sn, url, startedAt, origin }
     const recentFailMap= new Map();
@@ -313,7 +435,6 @@
       if (!url) return;
       recentFailMap.delete(url);
     }
-
     function takeOriginSlot(origin) {
       const cap = (origin && origin === location.origin) ? PREFETCH_CONC_GLOBAL : PREFETCH_CONC_PER_ORIGIN;
       const n = originSlots.get(origin) || 0;
@@ -327,8 +448,6 @@
       if (n <= 1) originSlots.delete(origin); else originSlots.set(origin, n - 1);
       if (DEBUG) log('slot released', origin, Math.max(0, n - 1));
     }
-
-    // ====== fLoader：命中优先/在途合并/stats 补齐（修复：交付时也给副本）======
     class CacheFirstFragLoader {
       constructor(cfg){
         const Hls = window.HlsOriginal || window.Hls || window.__HlsOriginal;
@@ -359,11 +478,9 @@
         this.context = context; this.config = config; this.callbacks = callbacks;
         this._resetStats();
         try { context.loader = this; } catch {}
-
         const url = context?.url;
         const isFrag = (context?.type === 'fragment') || !!context?.frag;
         const self = this;
-
         function goInner(){
           if (self.inner?.load) {
             if (!self.inner.stats) self.inner.stats = self.stats;
@@ -386,8 +503,6 @@
               .finally(()=> clearTimeout(timer));
           }
         }
-
-        // 1) LRU 命中（lruGet 已返回消费副本）
         if (isFrag && url) {
           const hit = lruGet(url);
           if (hit && abSize(hit) > 0) {
@@ -399,8 +514,6 @@
             return;
           }
         }
-
-        // 2) 在途合并（限时等待；交付副本，避免多个消费者共享同一引用）
         const p = (isFrag && url) ? inflightMap.get(url) : null;
         if (p) {
           let done = false;
@@ -423,15 +536,11 @@
           }).catch(() => { if (!done) { clearTimeout(timer); goInner(); }});
           return;
         }
-
-        // 3) 常规加载
         goInner();
       }
       abort(ctx){ if (this.stats) this.stats.aborted = true; try { this.inner?.abort?.(ctx); } catch {} }
       destroy(){ try { this.inner?.destroy?.(); } catch {} }
     }
-
-    // ====== 工具：绝对 URL/淘汰在途 ======
     function absUrlForFrag(details, frag){
       let u = frag && (frag.url || frag.relurl);
       if (!u) return '';
@@ -451,27 +560,21 @@
       });
       if (aborted && DEBUG) log('abort stale inflight', 'level=', level, 'floor=', floor, 'aborted=', aborted);
     }
-
-    // ====== 预取实现（优先原生 XHR → HlsLoader → fetch）======
     function prefetchWithXHR(hls, details, nf, url, origin){
       if (originBanUntil.get(origin) > performance.now()) { if (DEBUG) log('origin banned, skip XHR', origin); return null; }
       if (!takeOriginSlot(origin)) return null;
-
       const xhr = new Native.XHR();
       let cleaned = false;
       let timer = null;
       const timeoutMs = (hls?.config?.fragLoadTimeout) || PREFETCH_TIMEOUT_MS;
-
       const controller = { abort(){ try{ xhr.abort(); }catch{} } };
       inflightMeta.set(url, { controller, level: nf.level, sn: nf.sn, url, startedAt: performance.now(), origin });
-
       const p = new Promise((resolve) => {
         try {
           xhr.open('GET', url, true);
           xhr.responseType = 'arraybuffer';
           try { hls?.config?.xhrSetup && hls.config.xhrSetup(xhr, url); } catch {}
           xhr.timeout = timeoutMs;
-
           xhr.onload = function(){
             releaseOriginSlot(origin);
             cleanup();
@@ -499,14 +602,12 @@
             releaseOriginSlot(origin);
             cleanup(); resolve(null);
           };
-
           xhr.send();
           timer = setTimeout(()=>{ try{ xhr.abort(); }catch{} }, timeoutMs + 500);
         } catch {
           releaseOriginSlot(origin);
           cleanup(); resolve(null);
         }
-
         function cleanup(){
           if (cleaned) return;
           cleaned = true;
@@ -519,24 +620,19 @@
           if (fc >= 2) originBanUntil.set(origin, performance.now() + ORIGIN_BAN_MS);
         }
       }).finally(()=>{ inflightMeta.delete(url); inflightMap.delete(url); });
-
       inflightMap.set(url, p);
       return p;
     }
-
     function prefetchWithHlsLoader(hls, details, nf, url, origin) {
       const Hls = window.HlsOriginal || window.Hls || window.__HlsOriginal;
       const BaseLoader = Hls?.DefaultConfig?.loader;
       if (!BaseLoader) return null;
-
       if (originBanUntil.get(origin) > performance.now()) { if (DEBUG) log('origin banned, skip HlsLoader', origin); return null; }
       if (!takeOriginSlot(origin)) return null;
-
       const loader = new BaseLoader(hls?.config || {});
       const controller = { abort(){ try { loader.abort?.(); } catch {} } };
       const ctx = { url, responseType:'arraybuffer', type:'fragment', frag:nf };
       const timeoutMs = hls?.config?.fragLoadTimeout || PREFETCH_TIMEOUT_MS;
-
       let timer = null;
       const p = new Promise((resolve) => {
         try {
@@ -574,20 +670,16 @@
           resolve(null);
         }
       }).finally(()=>{ try{ loader.destroy?.(); }catch{}; inflightMeta.delete(url); inflightMap.delete(url); });
-
       inflightMeta.set(url, { controller, level: nf.level, sn: nf.sn, url, startedAt: performance.now(), origin });
       inflightMap.set(url, p);
       return p;
     }
-
     function prefetchWithFetch(details, nf, url, origin){
       if (originBanUntil.get(origin) > performance.now()) { if (DEBUG) log('origin banned, skip fetch', origin); return null; }
       if (!takeOriginSlot(origin)) return null;
-
       const controller = Native.AC ? new Native.AC() : new AbortController();
       const opts = { mode:'cors', credentials:'omit', signal: controller.signal };
       const timeout = setTimeout(()=> controller.abort(), PREFETCH_TIMEOUT_MS);
-
       const p = (Native.Fetch || fetch)(url, opts)
         .then(r => r.ok ? r.arrayBuffer() : null)
         .then(buf => {
@@ -611,32 +703,24 @@
           return null;
         })
         .finally(() => { clearTimeout(timeout); inflightMeta.delete(url); inflightMap.delete(url); });
-
       inflightMap.set(url, p);
       inflightMeta.set(url, { controller, level: nf.level, sn: nf.sn, url, startedAt: performance.now(), origin });
       return p;
     }
-
-    // ====== 预取调度 ======
     (function setupPrefetcher(){
       if (!ENABLE_PREFETCH) return;
-
       function prefetchFrag(hls, details, nf){
         const url = absUrlForFrag(details, nf);
         if (!url) return null;
         const origin = (()=>{ try { return new URL(url).origin; } catch { return ''; } })();
-
         if (lruHas(url)) { if (DEBUG) log('prefetch skip: LRU has', url); return inflightMap.get(url) || null; }
         if (inflightMap.has(url)) return inflightMap.get(url);
-
         const lastFail = recentFailMap.get(url);
         if (lastFail && (performance.now() - lastFail < FAIL_TTL_MS)) {
           if (DEBUG) log('prefetch skip: recent fail', url);
           return null;
         }
-
         if (inflightMap.size >= PREFETCH_CONC_GLOBAL) return null;
-
         const chain =
           PREFETCH_STRATEGY === 'hls-xhr-fetch' ? [
             () => prefetchWithHlsLoader(hls, details, nf, url, origin),
@@ -666,31 +750,23 @@
           p = fn();
           if (p) break;
         }
-
         p?.then(buf => { if (!buf) recentFailMap.set(url, performance.now()); })
           .finally(()=>{ inflightMeta.delete(url); inflightMap.delete(url); });
-
         return p;
       }
-
       function attach(hls){
         const Ev = hls.constructor?.Events || {};
-
         function scheduleAheadFromFrag(frag){
           try {
             if (!frag) return;
             const t = frag.type || 'video';
             if (t !== 'main' && t !== 'video') return;
-
             const level = frag.level;
             const S = frag.sn;
-
             floorSN.set(level, S);
             abortStaleInflight(level, S);
-
             const details = hls.levels && hls.levels[level] && hls.levels[level].details;
             if (!details || !Array.isArray(details.fragments)) return;
-
             let idx = details.fragments.findIndex(f => f.sn === S);
             if (idx < 0) {
               idx = 0;
@@ -698,7 +774,6 @@
                 if ((details.fragments[i].sn|0) >= (S|0)) { idx = i; break; }
               }
             }
-
             for (let k = 1; k <= PREFETCH_AHEAD; k++) {
               const nf = details.fragments[idx + k];
               if (!nf) break;
@@ -708,7 +783,6 @@
             }
           } catch (e) { if (DEBUG) log('scheduleAheadFromFrag error', e); }
         }
-
         hls.on(Ev.FRAG_LOADING, (_evt, data) => { scheduleAheadFromFrag(data && data.frag); });
         hls.on(Ev.FRAG_LOADED,  (_evt, data) => {
           const frag = data && data.frag;
@@ -722,13 +796,10 @@
             }
           } catch {}
         });
-
         log('prefetcher attached (XHR→HlsLoader→fetch; ahead=', PREFETCH_AHEAD, ', global=', PREFETCH_CONC_GLOBAL, ', perOrigin=', PREFETCH_CONC_PER_ORIGIN, ', wait=', WAIT_INFLIGHT_MS, 'ms)');
       }
       window.__HLS_BIGBUF_ATTACH_PREFETCH__ = attach;
     })();
-
-    // ====== 修补 Hls 类 ======
     function isCtor(v){ return typeof v === 'function'; }
     function protectGlobal(name, value){
       try { delete window[name]; } catch {}
@@ -745,12 +816,10 @@
         catch (e) { warn('adapter install failed', adapter?.name || 'unknown', e); }
       }
     }
-
     function patchHlsClass(OriginalHls){
       try{
         if(!OriginalHls || OriginalHls.__HLS_BIGBUF_PATCHED__ || !isCtor(OriginalHls)) return OriginalHls;
         window.HlsOriginal = window.__HlsOriginal = OriginalHls;
-
         const overrides = {
           maxBufferLength: VOD_BUFFER_SEC,
           maxMaxBufferLength: MAX_MAX_BUFFER_SEC,
@@ -761,12 +830,9 @@
           if (OriginalHls.DefaultConfig) Object.assign(OriginalHls.DefaultConfig, overrides);
           log('DefaultConfig applied', OriginalHls.DefaultConfig);
         } catch(e){ log('DefaultConfig assign failed (frozen?)', e); }
-
         class PatchedHls extends OriginalHls {
           constructor(userConfig = {}){
             const enforced = Object.assign({}, overrides, userConfig);
-
-            // 动态适配自定义 Loader (修复部分站点因自定义 Loader 被覆盖而无法播放的问题)
             if (ENABLE_MEMCACHE) {
               const UserLoader = userConfig.fLoader || userConfig.loader;
               if (UserLoader) {
@@ -782,10 +848,8 @@
                 enforced.fLoader = CacheFirstFragLoader;
               }
             }
-
             super(enforced);
             window.__HLS_BIGBUF_LAST__ = this;
-
             try {
               this.on(OriginalHls.Events.LEVEL_LOADED, (_evt, data) => {
                 const isLive = !!data?.details?.live;
@@ -806,17 +870,14 @@
                 }
               });
             } catch {}
-
             try {
               if (ENABLE_PREFETCH && typeof window.__HLS_BIGBUF_ATTACH_PREFETCH__ === 'function') {
                 window.__HLS_BIGBUF_ATTACH_PREFETCH__(this);
               }
             } catch {}
-
             log('Hls instance created with config', this.config, 'prefetch=', ENABLE_PREFETCH, 'memcache=', ENABLE_MEMCACHE);
           }
         }
-
         Object.getOwnPropertyNames(OriginalHls).forEach((name)=>{
           if (['length','prototype','name','DefaultConfig'].includes(name)) return;
           try { Object.defineProperty(PatchedHls, name, Object.getOwnPropertyDescriptor(OriginalHls, name)); } catch {}
@@ -826,7 +887,6 @@
           set(v){ OriginalHls.DefaultConfig = v; }
         });
         Object.defineProperty(PatchedHls, '__HLS_BIGBUF_PATCHED__', { value: true });
-
         log('PatchedHls ready. version=', OriginalHls.version, 'events=', OriginalHls.Events);
         return PatchedHls;
       }catch(e){
@@ -834,7 +894,6 @@
         return OriginalHls;
       }
     }
-
     function armSetterOnce(){
       if ('Hls' in window && isCtor(window.Hls)) {
         const Patched = patchHlsClass(window.Hls);
@@ -857,7 +916,6 @@
         }
       });
       if (window === window.top) log('Setter hook armed (page/iframe context, waiting for window.Hls)');
-
       if (window === window.top) setTimeout(()=>{
         if(!window.Hls || (window.Hls && !window.Hls.__HLS_BIGBUF_PATCHED__)){
           const hints = {
@@ -880,8 +938,6 @@
     runAdapters();
   })();
   `;
-
-  // ====== 仅在未禁用时注入 ======
   function injectInto(doc = document) {
     try {
       if (isBlockedForDoc(doc)) {
@@ -891,7 +947,6 @@
         return;
       }
     } catch {}
-
     if (!doc.documentElement) {
       const onReady = () => {
         doc.removeEventListener('readystatechange', onReady);
@@ -900,14 +955,12 @@
       doc.addEventListener('readystatechange', onReady);
       return;
     }
-
     try {
       if (typeof GM_addElement === 'function') {
         GM_addElement(doc.documentElement, 'script', { textContent: PAYLOAD });
         return;
       }
     } catch {}
-
     const s = doc.createElement('script');
     const nonce = doc.querySelector('script[nonce]')?.nonce;
     if (nonce) s.setAttribute('nonce', nonce);
@@ -915,9 +968,7 @@
     (doc.head || doc.documentElement).appendChild(s);
     s.remove();
   }
-
   injectInto(document);
-
   function tryInjectIframe(iframe) {
     try {
       const d = iframe.contentDocument;
@@ -926,7 +977,6 @@
       injectInto(d);
     } catch { /* 跨域: 该域会按 @match 自行注入 */ }
   }
-
   Array.from(document.getElementsByTagName('iframe')).forEach(tryInjectIframe);
   new MutationObserver(muts => {
     for (const m of muts) {
@@ -936,4 +986,3 @@
     }
   }).observe(document.documentElement, { childList: true, subtree: true });
 })();
-
