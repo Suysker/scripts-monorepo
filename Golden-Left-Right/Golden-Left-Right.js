@@ -3,7 +3,7 @@
 // @description  按住"→"键倍速播放，按住"←"键减速播放，松开恢复原来的倍速，轻松追剧，看视频更灵活，还能快进/跳过大部分网站的广告！~ 支持用户单独配置倍速和秒数，并可根据根域名启用或禁用脚本
 // @icon         https://image.suysker.xyz/i/2023/10/09/artworks-QOnSW1HR08BDMoe9-GJTeew-t500x500.webp
 // @namespace    http://tampermonkey.net/
-// @version      1.0.10
+// @version      1.1.0
 // @author       Suysker
 // @match        http://*/*
 // @match        https://*/*
@@ -22,6 +22,12 @@
     const DEFAULT_TIME = 5;                // 默认秒数
     const DEFAULT_RL_TIME = 180;           // 左右同时按下秒数
     const DOMAIN_BLOCK_LIST_KEY = "blockedDomains"; // 存储禁用的根域名列表的键名
+    const GLOBAL_ENABLE_KEY = 'globalEnabled';
+    const SETTING_PLAYBACK_RATE_KEY = 'playbackRate';
+    const SETTING_CHANGE_TIME_KEY = 'changeTime';
+    const SETTING_BOTH_KEYS_TIME_KEY = 'bothKeysJumpTime';
+    const GLR_CFG_MODAL_ID = 'glr-config-modal';
+    const GLR_CFG_STYLE_ID = 'glr-config-style';
 
     // -------------------- State Variables --------------------
     let keyboardEventsRegistered = false;  // 确保键盘事件只注册一次
@@ -31,6 +37,7 @@
     const state = {
         playbackRate: DEFAULT_RATE,        // 播放倍速
         changeTime: DEFAULT_TIME,          // 快进/回退秒数
+        bothKeysJumpTime: DEFAULT_RL_TIME, // 左右同时按下快进秒数
         pageVideo: null,
         lastPlayedVideo: null,             // 记录上一个播放过的视频（通过 play 事件更新）
         originalPlaybackRate: 1,           // 存储原来的播放速度
@@ -70,6 +77,146 @@
         await GM_setValue(key, value);
     };
 
+    const readBoolSetting = async (key, defaultValue) => {
+        const raw = await loadSetting(key, defaultValue);
+        return raw === true || raw === 1 || raw === '1';
+    };
+
+    const CONFIG_FIELDS = Object.freeze([
+        { group: '倍速控制', key: SETTING_PLAYBACK_RATE_KEY, stateKey: 'playbackRate', label: '按住右键的加速倍速', def: DEFAULT_RATE, min: 1, max: 16, step: 0.1 },
+        { group: '单键跳转', key: SETTING_CHANGE_TIME_KEY, stateKey: 'changeTime', label: '松开左右键跳转秒数', def: DEFAULT_TIME, min: 0.5, max: 120, step: 0.5 },
+        { group: '组合键动作', key: SETTING_BOTH_KEYS_TIME_KEY, stateKey: 'bothKeysJumpTime', label: '左右同时按下快进秒数', def: DEFAULT_RL_TIME, min: 10, max: 1800, step: 5 }
+    ]);
+
+    const getStepDigits = (step) => {
+        const text = String(step || 1);
+        const index = text.indexOf('.');
+        return index >= 0 ? (text.length - index - 1) : 0;
+    };
+
+    const clampNumber = (value, min, max) => {
+        return Math.min(max, Math.max(min, value));
+    };
+
+    const normalizeFieldNumber = (value, field) => {
+        const step = Number(field.step) || 1;
+        const digits = getStepDigits(step);
+        const base = Number.isFinite(Number(value)) ? Number(value) : field.def;
+        const clamped = clampNumber(base, field.min, field.max);
+        const snapped = Math.round(clamped / step) * step;
+        const fixed = Number(snapped.toFixed(digits));
+        return clampNumber(fixed, field.min, field.max);
+    };
+
+    const formatFieldNumber = (value, field) => {
+        const digits = getStepDigits(field.step);
+        if (digits === 0) return String(Math.round(value));
+        return Number(value).toFixed(digits).replace(/\.?0+$/, '');
+    };
+
+    const readConfigFieldValue = async (field) => {
+        const raw = await loadSetting(field.key, field.def);
+        const normalized = normalizeFieldNumber(raw, field);
+        state[field.stateKey] = normalized;
+        return normalized;
+    };
+
+    const setDefaultControlValue = (field, control) => {
+        const normalized = normalizeFieldNumber(field.def, field);
+        const formatted = formatFieldNumber(normalized, field);
+        control.range.value = formatted;
+        control.num.value = formatted;
+    };
+
+    const saveConfigFieldValue = async (field, control) => {
+        const raw = String(control.num.value || '').trim();
+        if (!raw) throw new Error(`${field.label} 不能为空`);
+        const num = Number(raw);
+        if (!Number.isFinite(num)) throw new Error(`${field.label} 必须是数字`);
+        const normalized = normalizeFieldNumber(num, field);
+        const formatted = formatFieldNumber(normalized, field);
+        control.range.value = formatted;
+        control.num.value = formatted;
+        state[field.stateKey] = normalized;
+        await saveSetting(field.key, normalized);
+    };
+
+    const ensureConfigStyle = () => {
+        if (document.getElementById(GLR_CFG_STYLE_ID)) return;
+        const style = document.createElement('style');
+        style.id = GLR_CFG_STYLE_ID;
+        style.textContent = `#${GLR_CFG_MODAL_ID}{position:fixed;inset:0;z-index:2147483647;background:radial-gradient(1200px 520px at 8% -6%,rgba(255,212,229,.38),transparent 66%),radial-gradient(980px 520px at 100% 100%,rgba(233,232,236,.44),transparent 67%),rgba(245,240,243,.74);display:flex;align-items:center;justify-content:center;font:12px/1.3 "Segoe UI","PingFang SC","Microsoft YaHei",sans-serif;color:#4a4350}#${GLR_CFG_MODAL_ID} .panel{width:min(1080px,96vw);max-height:min(92vh,760px);display:grid;grid-template-rows:auto auto;gap:10px;padding:14px;border-radius:20px;border:1px solid #f0d6e2;background:linear-gradient(145deg,rgba(255,255,255,.96),rgba(244,238,242,.95));box-shadow:0 16px 40px rgba(104,88,99,.22),inset 0 1px 0 rgba(255,255,255,.9)}#${GLR_CFG_MODAL_ID} h2{margin:0;font-size:22px;color:#544a56}#${GLR_CFG_MODAL_ID} .head{display:flex;justify-content:space-between;align-items:flex-start;gap:10px;flex-wrap:wrap}#${GLR_CFG_MODAL_ID} .hint{margin:4px 0 0;color:#7b6f7c}#${GLR_CFG_MODAL_ID} .sections{display:grid;grid-template-columns:repeat(3,minmax(220px,1fr));gap:8px}#${GLR_CFG_MODAL_ID} .group{background:linear-gradient(150deg,rgba(255,255,255,.98),rgba(247,242,245,.96));border:1px solid #ecdde6;border-radius:12px;padding:8px}#${GLR_CFG_MODAL_ID} .group h3{margin:0 0 6px;font-size:13px;color:#5f5462}#${GLR_CFG_MODAL_ID} .group-grid{display:grid;grid-template-columns:1fr;gap:6px}#${GLR_CFG_MODAL_ID} .field{background:#fff;border:1px solid #efe4eb;border-radius:10px;padding:7px;box-shadow:inset 0 1px 0 rgba(255,255,255,.9)}#${GLR_CFG_MODAL_ID} .title{font-size:11px;color:#5f5463;margin-bottom:5px}#${GLR_CFG_MODAL_ID} .num{display:grid;grid-template-columns:1fr 92px;gap:6px;align-items:center}#${GLR_CFG_MODAL_ID} input[type=number]{width:100%;box-sizing:border-box;border:1px solid #dcced7;border-radius:7px;padding:5px 6px;font-size:12px;color:#4a4150;background:#fefcfd;text-align:center}#${GLR_CFG_MODAL_ID} input[type=range]{width:100%;accent-color:#d88cae}#${GLR_CFG_MODAL_ID} .actions{display:flex;justify-content:flex-end;gap:8px}#${GLR_CFG_MODAL_ID} .head .actions{margin-left:auto}#${GLR_CFG_MODAL_ID} button{border:1px solid #dccad5;border-radius:9px;padding:7px 12px;cursor:pointer;font-weight:700;color:#5d4f60;background:#faf6f8}#${GLR_CFG_MODAL_ID} button.primary{background:linear-gradient(135deg,#f7d2e3,#f2bad4);border-color:#de9dbe;color:#4f3c49}`;
+        (document.head || document.documentElement).appendChild(style);
+    };
+
+    const openConfigPanel = async () => {
+        if (!document.body) {
+            alert('页面尚未加载完成，请稍后重试。');
+            return;
+        }
+        ensureConfigStyle();
+        document.getElementById(GLR_CFG_MODAL_ID)?.remove();
+
+        const modal = document.createElement('div');
+        modal.id = GLR_CFG_MODAL_ID;
+        modal.innerHTML = '<div class="panel"><div class="head"><div><h2>⚙️ 黄金左右键 参数配置</h2><p class="hint">调整倍速与跳转参数，保存后立即生效，无需刷新。</p></div><div class="actions"><button data-act="close">关闭</button><button data-act="reset">恢复默认</button><button class="primary" data-act="save">保存配置</button></div></div><div class="sections" data-zone="sections"></div></div>';
+
+        const sectionsZone = modal.querySelector('[data-zone="sections"]');
+        const groups = new Map();
+        const controls = new Map();
+
+        for (const field of CONFIG_FIELDS) {
+            let groupGrid = groups.get(field.group);
+            if (!groupGrid) {
+                const group = document.createElement('section');
+                group.className = 'group';
+                group.innerHTML = `<h3>${field.group}</h3><div class="group-grid"></div>`;
+                sectionsZone.appendChild(group);
+                groupGrid = group.querySelector('.group-grid');
+                groups.set(field.group, groupGrid);
+            }
+
+            const row = document.createElement('div');
+            row.className = 'field';
+            row.innerHTML = `<div class="title">${field.label}</div><div class="num"><input type="range" min="${field.min}" max="${field.max}" step="${field.step}"><input type="number" min="${field.min}" max="${field.max}" step="${field.step}"></div>`;
+            const range = row.querySelector('input[type="range"]');
+            const num = row.querySelector('input[type="number"]');
+            const value = await readConfigFieldValue(field);
+            const formatted = formatFieldNumber(value, field);
+            range.value = formatted;
+            num.value = formatted;
+            range.addEventListener('input', () => { num.value = range.value; });
+            num.addEventListener('input', () => {
+                const v = Number(num.value);
+                if (Number.isFinite(v)) range.value = formatFieldNumber(normalizeFieldNumber(v, field), field);
+            });
+
+            groupGrid.appendChild(row);
+            controls.set(field.key, { range, num });
+        }
+
+        const close = () => modal.remove();
+        modal.addEventListener('click', (event) => { if (event.target === modal) close(); });
+        modal.querySelector('[data-act="close"]').addEventListener('click', close);
+        modal.querySelector('[data-act="reset"]').addEventListener('click', () => {
+            for (const field of CONFIG_FIELDS) {
+                setDefaultControlValue(field, controls.get(field.key));
+            }
+        });
+        modal.querySelector('[data-act="save"]').addEventListener('click', async () => {
+            try {
+                for (const field of CONFIG_FIELDS) {
+                    await saveConfigFieldValue(field, controls.get(field.key));
+                }
+                alert('配置已保存，已立即生效。');
+                close();
+            } catch (error) {
+                alert(`保存失败：${error?.message || error}`);
+            }
+        });
+        document.body.appendChild(modal);
+    };
+
     /**
      * Retrieves the root domain of the current website.
      * @returns {string} - The root domain (e.g., example.com).
@@ -86,7 +233,6 @@
         // If the last part is a country code top-level domain (ccTLD), consider three parts
         const ccTLDs = ['uk', 'jp', 'cn', 'au', 'nz', 'br', 'fr', 'de', 'kr', 'in', 'ru'];
         const lastPart = domainParts[domainParts.length - 1];
-        const secondLastPart = domainParts[domainParts.length - 2];
 
         if (ccTLDs.includes(lastPart) && domainParts.length >= 3) {
             return domainParts.slice(-3).join('.');
@@ -104,6 +250,8 @@
         const currentDomain = getRootDomain();
         return blockedDomains.includes(currentDomain);
     };
+
+    const isGlobalEnabled = () => readBoolSetting(GLOBAL_ENABLE_KEY, true);
 
     /**
      * Toggles the current domain's blocked status.
@@ -126,7 +274,17 @@
             isNowBlocked = false;
         }
 
-        handleKeyboardEvents(!isNowBlocked); // 根据新状态立即启用/禁用键盘事件
+        const globalEnabled = await isGlobalEnabled();
+        handleKeyboardEvents(globalEnabled && !isNowBlocked); // 根据全局+站点状态立即启用/禁用键盘事件
+    };
+
+    const toggleGlobalStatus = async () => {
+        const current = await isGlobalEnabled();
+        const next = !current;
+        await saveSetting(GLOBAL_ENABLE_KEY, next);
+        const domainBlocked = await isDomainBlocked();
+        handleKeyboardEvents(next && !domainBlocked);
+        alert(`已${next ? '启用' : '停用'}全局状态`);
     };
 
     /**
@@ -250,7 +408,7 @@
      * Determines the optimal video element to control.
      * @returns {Promise<HTMLVideoElement|null>} - The selected video element or null.
      */
-    const getOptimalPageVideo = async () => {
+    const getOptimalPageVideo = () => {
         // 检查 lastPlayedVideo 是否存在且可见，不检查是否正在播放
         if (state.lastPlayedVideo && isVideoVisible(state.lastPlayedVideo)) {
             log('lastPlayedVideo 存在且可见');
@@ -274,8 +432,8 @@
      * Checks and updates the current page video.
      * @returns {Promise<boolean>} - True if a video is found, else false.
      */
-    const checkPageVideo = async () => {
-        state.pageVideo = await getOptimalPageVideo();
+    const checkPageVideo = () => {
+        state.pageVideo = getOptimalPageVideo();
         if (!state.pageVideo) {
             log('未找到符合条件的视频');
             return false;
@@ -301,7 +459,7 @@
             disableFocus(progressBar);
             progressBar.querySelectorAll('*').forEach(disableFocus);
 
-            console.debug('已配置进度条:', progressBar);
+            log('已配置进度条:', progressBar);
         };
 
         // 初始配置页面上已有的进度条
@@ -333,7 +491,7 @@
      * Registers or unregisters keyboard event listeners.
      * @param {boolean} enable - True to register, false to unregister.
      */
-    const handleKeyboardEvents = async (enable) => {
+    const handleKeyboardEvents = (enable) => {
         if (enable && !keyboardEventsRegistered) {
             // 将事件监听器绑定到 document 对象，使用 capture 模式，确保优先级更高
             document.addEventListener('keydown', onRightKeyDown, { capture: true });
@@ -356,10 +514,10 @@
      * Checks if both left and right keys are pressed.
      * @returns {Promise<boolean>} - True if both are pressed and action is taken.
      */
-    const checkBothKeysPressed = async () => {
-        if (state.rightKeyDownCount === 1 && state.leftKeyDownCount === 1 && await checkPageVideo()) {
-            state.pageVideo.currentTime += DEFAULT_RL_TIME;
-            log(`同时按下左右键，快进 ${DEFAULT_RL_TIME} 秒`);
+    const checkBothKeysPressed = () => {
+        if (state.rightKeyDownCount === 1 && state.leftKeyDownCount === 1 && checkPageVideo()) {
+            state.pageVideo.currentTime += state.bothKeysJumpTime;
+            log(`同时按下左右键，快进 ${state.bothKeysJumpTime} 秒`);
             // Reset counts to prevent repeated triggering
             state.rightKeyDownCount = 0;
             state.leftKeyDownCount = 0;
@@ -372,16 +530,16 @@
      * Handles the right arrow key down event.
      * @param {KeyboardEvent} e - The keyboard event.
      */
-    const onRightKeyDown = async (e) => {
+    const onRightKeyDown = (e) => {
         if (e.code !== 'ArrowRight' || isInputFocused()) return;
         e.preventDefault();
         e.stopPropagation();
         state.rightKeyDownCount++;
 
         // 检查是否同时按下左右键
-        if (await checkBothKeysPressed()) return;
+        if (checkBothKeysPressed()) return;
 
-        if (state.rightKeyDownCount === 2 && await checkPageVideo() && isVideoPlaying(state.pageVideo)) {
+        if (state.rightKeyDownCount === 2 && checkPageVideo() && isVideoPlaying(state.pageVideo)) {
             state.originalPlaybackRate = state.pageVideo.playbackRate;
             state.pageVideo.playbackRate = state.playbackRate;
             log('加速播放中, 倍速: ' + state.playbackRate);
@@ -392,12 +550,12 @@
      * Handles the right arrow key up event.
      * @param {KeyboardEvent} e - The keyboard event.
      */
-    const onRightKeyUp = async (e) => {
+    const onRightKeyUp = (e) => {
         if (e.code !== 'ArrowRight' || isInputFocused()) return;
         e.preventDefault();
         e.stopPropagation();
 
-        if (state.rightKeyDownCount === 1 && await checkPageVideo()) {
+        if (state.rightKeyDownCount === 1 && checkPageVideo()) {
             state.pageVideo.currentTime += state.changeTime;
             log('前进 ' + state.changeTime + ' 秒');
         }
@@ -415,16 +573,16 @@
      * Handles the left arrow key down event.
      * @param {KeyboardEvent} e - The keyboard event.
      */
-    const onLeftKeyDown = async (e) => {
+    const onLeftKeyDown = (e) => {
         if (e.code !== 'ArrowLeft' || isInputFocused()) return;
         e.preventDefault();
         e.stopPropagation();
         state.leftKeyDownCount++;
 
         // 检查是否同时按下左右键
-        if (await checkBothKeysPressed()) return;
+        if (checkBothKeysPressed()) return;
 
-        if (state.leftKeyDownCount === 2 && await checkPageVideo() && isVideoPlaying(state.pageVideo)) {
+        if (state.leftKeyDownCount === 2 && checkPageVideo() && isVideoPlaying(state.pageVideo)) {
             state.originalPlaybackRate = state.pageVideo.playbackRate;
             state.pageVideo.playbackRate = 1 / state.playbackRate;
             log('减速播放中, 倍速: ' + state.pageVideo.playbackRate);
@@ -435,12 +593,12 @@
      * Handles the left arrow key up event.
      * @param {KeyboardEvent} e - The keyboard event.
      */
-    const onLeftKeyUp = async (e) => {
+    const onLeftKeyUp = (e) => {
         if (e.code !== 'ArrowLeft' || isInputFocused()) return;
         e.preventDefault();
         e.stopPropagation();
 
-        if (state.leftKeyDownCount === 1 && await checkPageVideo()) {
+        if (state.leftKeyDownCount === 1 && checkPageVideo()) {
             state.pageVideo.currentTime -= state.changeTime;
             log('回退 ' + state.changeTime + ' 秒');
         }
@@ -454,42 +612,6 @@
         state.leftKeyDownCount = 0;
     };
 
-    // -------------------- Configuration Functions --------------------
-
-    /**
-     * Prompts the user to set a new playback rate.
-     */
-    const configurePlaybackRate = async () => {
-        const newRate = prompt('请输入新的播放倍速 (当前: ' + state.playbackRate + ')', state.playbackRate);
-        if (newRate !== null) {
-            const parsedRate = parseFloat(newRate);
-            if (!isNaN(parsedRate) && parsedRate > 0) {
-                state.playbackRate = parsedRate;
-                await saveSetting('playbackRate', state.playbackRate);
-                log('播放倍速设置为: ' + state.playbackRate);
-            } else {
-                alert('请输入一个有效的倍速数字。');
-            }
-        }
-    };
-
-    /**
-     * Prompts the user to set a new change time for fast-forward/rewind.
-     */
-    const configureChangeTime = async () => {
-        const newTime = prompt('请输入新的快进/回退秒数 (当前: ' + state.changeTime + ')', state.changeTime);
-        if (newTime !== null) {
-            const parsedTime = parseFloat(newTime);
-            if (!isNaN(parsedTime) && parsedTime > 0) {
-                state.changeTime = parsedTime;
-                await saveSetting('changeTime', state.changeTime);
-                log('快进/回退秒数设置为: ' + state.changeTime);
-            } else {
-                alert('请输入一个有效的秒数。');
-            }
-        }
-    };
-
     // -------------------- Initialization --------------------
 
     /**
@@ -497,16 +619,37 @@
      */
     const init = async () => {
         try {
-            state.playbackRate = await loadSetting('playbackRate', DEFAULT_RATE);
-            state.changeTime = await loadSetting('changeTime', DEFAULT_TIME);
+            state.playbackRate = normalizeFieldNumber(await loadSetting(SETTING_PLAYBACK_RATE_KEY, DEFAULT_RATE), CONFIG_FIELDS[0]);
+            state.changeTime = normalizeFieldNumber(await loadSetting(SETTING_CHANGE_TIME_KEY, DEFAULT_TIME), CONFIG_FIELDS[1]);
+            state.bothKeysJumpTime = normalizeFieldNumber(await loadSetting(SETTING_BOTH_KEYS_TIME_KEY, DEFAULT_RL_TIME), CONFIG_FIELDS[2]);
             
-            const isBlocked = await isDomainBlocked();
-            handleKeyboardEvents(!isBlocked);
+            const [globalEnabled, isBlocked] = await Promise.all([
+                isGlobalEnabled(),
+                isDomainBlocked()
+            ]);
+            handleKeyboardEvents(globalEnabled && !isBlocked);
 
             // Register menu commands
-            GM_registerMenuCommand('启用/禁用黄金左右键', toggleCurrentDomain);
-            GM_registerMenuCommand('设置播放倍速', configurePlaybackRate);
-            GM_registerMenuCommand('设置快进/回退秒数', configureChangeTime);
+            if (typeof GM_registerMenuCommand === 'function' && window.top === window) {
+                const currentDomain = getRootDomain();
+                GM_registerMenuCommand(
+                    globalEnabled
+                        ? '🔌 全局状态（当前：启用）'
+                        : '🔌 全局状态（当前：停用）',
+                    toggleGlobalStatus
+                );
+                GM_registerMenuCommand(
+                    isBlocked
+                        ? `✅ 在此站点启用（当前：停用 @ ${currentDomain})`
+                        : `⛔ 在此站点停用（当前：启用 @ ${currentDomain})`,
+                    toggleCurrentDomain
+                );
+                GM_registerMenuCommand('⚙️ 打开参数配置页', () => {
+                    openConfigPanel().catch((error) => {
+                        alert(`打开配置页失败：${error?.message || error}`);
+                    });
+                });
+            }
 
             // Cache existing videos and set up listeners
             cacheAllVideos();
