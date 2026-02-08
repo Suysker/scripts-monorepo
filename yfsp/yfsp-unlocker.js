@@ -5,6 +5,9 @@
 // @description  Unlocks quality UI, danmu styles (color/type/font/avatar/location), and playback speed UI. Keeps UI responsive when server omits high-bitrate paths. Blocks common ad overlays.
 // @author       YFSP Analyst
 // @match        *://*.yfsp.tv/*
+// @match        *://*.yifan.tv/*
+// @match        *://*.iyf.tv/*
+// @match        *://*.aiyifan.tv/*
 // @match        *://*.dudupro.com/*
 // @run-at       document-start
 // @grant        unsafeWindow
