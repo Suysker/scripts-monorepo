@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         YFSP.TV Unlocker
 // @namespace    http://tampermonkey.net/
-// @version      1.4
-// @description  Unlocks quality UI, danmu styles (color/type/font/avatar/location), and playback speed UI. Adds click-to-toggle play/pause. Improves NVIDIA RTX VSR compatibility by removing transparent overlay layers, and (optionally) forcing fullscreen on the <video> element so the driver can detect a clean video plane.
+// @version      1.5
+// @description  Unlocks quality UI, danmu styles (color/type/font/avatar/location), and playback speed UI. Adds click-to-toggle play/pause. Improves NVIDIA RTX VSR compatibility by forcing fullscreen on the <video> element.
 // @author       YFSP Analyst
 // @match        *://*.yfsp.tv/*
 // @match        *://*.yifan.tv/*
@@ -25,7 +25,6 @@
     const BOOTSTRAP_INTERVAL_MS = 2000;
     const CLICK_TOGGLE_DELAY_MS = 250;
     const MIN_CLICK_TOGGLE_VIDEO_EDGE_PX = 120;
-    const VSR_FULLSCREEN_CLASS = 'yfsp-vsr-fullscreen';
     const FORCE_NATIVE_VIDEO_FULLSCREEN = true;
 
     const MATCH_USER = [/\/api\/payment\/getPaymentInfo/i, /\/api\/user\/info/i];
@@ -310,18 +309,7 @@
             '.dn-dialog-background { display: none !important; }',
             '#dn_iframe { display: none !important; }',
             'vg-quality-selector .vip-label { display: none !important; }',
-            '.quality-btn { opacity: 1 !important; pointer-events: auto !important; }',
-            // Desktop player UX + NVIDIA RTX VSR compatibility:
-            // The site keeps a transparent overlay above <video>, which blocks click-to-pause and may prevent GPU overlay promotion.
-            // Only apply on pointer:fine so touch UIs can keep their tap overlays if needed.
-            '@media (pointer: fine) {',
-            '  aa-videoplayer .vg-overlay-play { display: none !important; }',
-            '  aa-videoplayer vg-controls.hide { display: none !important; }',
-            '  aa-videoplayer vg-scrub-bar.hide { display: none !important; }',
-            '  aa-videoplayer .overlay-logo.hide { display: none !important; }',
-            `  .${VSR_FULLSCREEN_CLASS} aa-videoplayer vg-overlay-danmu { display: none !important; }`,
-            `  .${VSR_FULLSCREEN_CLASS} aa-videoplayer vg-overlay-subtitle { display: none !important; }`,
-            '}'
+            '.quality-btn { opacity: 1 !important; pointer-events: auto !important; }'
         ].join('\n');
 
         (document.head || document.documentElement).appendChild(style);
@@ -357,27 +345,6 @@
         });
         observer.observe(document.documentElement, { childList: true, subtree: true });
         window.__yfsp_observer = observer;
-    };
-
-    const installFullscreenClassObserver = () => {
-        if (window.__yfsp_fullscreen_observer_installed) return;
-        window.__yfsp_fullscreen_observer_installed = true;
-
-        const update = () => {
-            try {
-                const isFullscreen = Boolean(
-                    document.fullscreenElement || document.webkitFullscreenElement || document.msFullscreenElement
-                );
-                if (!document.documentElement) return;
-                document.documentElement.classList.toggle(VSR_FULLSCREEN_CLASS, isFullscreen);
-            } catch (e) {}
-        };
-
-        ['fullscreenchange', 'webkitfullscreenchange', 'msfullscreenchange'].forEach((eventName) => {
-            document.addEventListener(eventName, update, true);
-        });
-
-        update();
     };
 
     const isVisibleCandidateVideo = (video) => {
@@ -917,7 +884,6 @@
         ensureStyle();
         hideAds();
         observeDom();
-        installFullscreenClassObserver();
         installClickToggle();
         installNativeFullscreenHijack();
         hookAngular();
