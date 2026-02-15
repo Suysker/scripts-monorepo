@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         YFSP.TV Unlocker
 // @namespace    http://tampermonkey.net/
-// @version      1.1
-// @description  Unlocks quality UI, danmu styles (color/type/font/avatar/location), and playback speed UI. Keeps UI responsive when server omits high-bitrate paths. Blocks common ad overlays.
+// @version      1.4
+// @description  Unlocks quality UI, danmu styles (color/type/font/avatar/location), and playback speed UI. Adds click-to-toggle play/pause. Improves NVIDIA RTX VSR compatibility by removing transparent overlay layers, and (optionally) forcing fullscreen on the <video> element so the driver can detect a clean video plane.
 // @author       YFSP Analyst
 // @match        *://*.yfsp.tv/*
 // @match        *://*.yifan.tv/*
@@ -23,6 +23,10 @@
     const DEFAULT_ROLE_ID = 1;
     const MIN_LEVEL = 2;
     const BOOTSTRAP_INTERVAL_MS = 2000;
+    const CLICK_TOGGLE_DELAY_MS = 250;
+    const MIN_CLICK_TOGGLE_VIDEO_EDGE_PX = 120;
+    const VSR_FULLSCREEN_CLASS = 'yfsp-vsr-fullscreen';
+    const FORCE_NATIVE_VIDEO_FULLSCREEN = true;
 
     const MATCH_USER = [/\/api\/payment\/getPaymentInfo/i, /\/api\/user\/info/i];
     const MATCH_PLAY = [/\/v3\/video\/play/i, /\/v3\/video\/detail/i];
@@ -306,7 +310,18 @@
             '.dn-dialog-background { display: none !important; }',
             '#dn_iframe { display: none !important; }',
             'vg-quality-selector .vip-label { display: none !important; }',
-            '.quality-btn { opacity: 1 !important; pointer-events: auto !important; }'
+            '.quality-btn { opacity: 1 !important; pointer-events: auto !important; }',
+            // Desktop player UX + NVIDIA RTX VSR compatibility:
+            // The site keeps a transparent overlay above <video>, which blocks click-to-pause and may prevent GPU overlay promotion.
+            // Only apply on pointer:fine so touch UIs can keep their tap overlays if needed.
+            '@media (pointer: fine) {',
+            '  aa-videoplayer .vg-overlay-play { display: none !important; }',
+            '  aa-videoplayer vg-controls.hide { display: none !important; }',
+            '  aa-videoplayer vg-scrub-bar.hide { display: none !important; }',
+            '  aa-videoplayer .overlay-logo.hide { display: none !important; }',
+            `  .${VSR_FULLSCREEN_CLASS} aa-videoplayer vg-overlay-danmu { display: none !important; }`,
+            `  .${VSR_FULLSCREEN_CLASS} aa-videoplayer vg-overlay-subtitle { display: none !important; }`,
+            '}'
         ].join('\n');
 
         (document.head || document.documentElement).appendChild(style);
@@ -342,6 +357,220 @@
         });
         observer.observe(document.documentElement, { childList: true, subtree: true });
         window.__yfsp_observer = observer;
+    };
+
+    const installFullscreenClassObserver = () => {
+        if (window.__yfsp_fullscreen_observer_installed) return;
+        window.__yfsp_fullscreen_observer_installed = true;
+
+        const update = () => {
+            try {
+                const isFullscreen = Boolean(
+                    document.fullscreenElement || document.webkitFullscreenElement || document.msFullscreenElement
+                );
+                if (!document.documentElement) return;
+                document.documentElement.classList.toggle(VSR_FULLSCREEN_CLASS, isFullscreen);
+            } catch (e) {}
+        };
+
+        ['fullscreenchange', 'webkitfullscreenchange', 'msfullscreenchange'].forEach((eventName) => {
+            document.addEventListener(eventName, update, true);
+        });
+
+        update();
+    };
+
+    const isVisibleCandidateVideo = (video) => {
+        if (!video || video.tagName !== 'VIDEO') return false;
+        const computed = getComputedStyle(video);
+        if (computed.display === 'none' || computed.visibility === 'hidden') return false;
+
+        const rect = video.getBoundingClientRect();
+        if (rect.width < MIN_CLICK_TOGGLE_VIDEO_EDGE_PX || rect.height < MIN_CLICK_TOGGLE_VIDEO_EDGE_PX) return false;
+        return true;
+    };
+
+    const findMainVideoElement = () => {
+        const direct = document.getElementById('video_player');
+        if (isVisibleCandidateVideo(direct)) return direct;
+
+        const root =
+            document.querySelector('aa-videoplayer') ||
+            document.querySelector('vg-player#main-player') ||
+            document.querySelector('.video-container') ||
+            document;
+
+        const candidates = Array.from(root.querySelectorAll('video')).filter(isVisibleCandidateVideo);
+        if (!candidates.length) return null;
+
+        let best = null;
+        let bestArea = 0;
+        candidates.forEach((video) => {
+            const rect = video.getBoundingClientRect();
+            const area = rect.width * rect.height;
+            if (area > bestArea) {
+                bestArea = area;
+                best = video;
+            }
+        });
+
+        return best;
+    };
+
+    const shouldIgnoreToggleClickTarget = (target) => {
+        if (!target || typeof target.closest !== 'function') return false;
+
+        return Boolean(
+            target.closest(
+                [
+                    'vg-controls',
+                    'vg-scrub-bar',
+                    'vg-quality-selector',
+                    'button',
+                    'a',
+                    'input',
+                    'textarea',
+                    'select',
+                    '[role="button"]',
+                    '[role="slider"]',
+                    '[contenteditable="true"]'
+                ].join(', ')
+            )
+        );
+    };
+
+    const installClickToggle = () => {
+        if (window.__yfsp_click_toggle_installed) return;
+        window.__yfsp_click_toggle_installed = true;
+
+        let timer = null;
+
+        const cancelPendingToggle = () => {
+            if (!timer) return;
+            clearTimeout(timer);
+            timer = null;
+        };
+
+        document.addEventListener(
+            'dblclick',
+            () => {
+                cancelPendingToggle();
+            },
+            true
+        );
+
+        document.addEventListener(
+            'click',
+            (event) => {
+                try {
+                    if (!event || event.defaultPrevented) return;
+                    if (event.button !== 0) return;
+                    if (event.metaKey || event.ctrlKey || event.shiftKey || event.altKey) return;
+                    if (!event.target || typeof event.target.closest !== 'function') return;
+                    if (!event.target.closest('aa-videoplayer, vg-player#main-player, .video-container')) return;
+                    if (shouldIgnoreToggleClickTarget(event.target)) return;
+
+                    // Suppress click-to-toggle when the user double clicks (e.g., fullscreen), matching typical players.
+                    if (event.detail && event.detail > 1) {
+                        cancelPendingToggle();
+                        return;
+                    }
+
+                    cancelPendingToggle();
+                    timer = setTimeout(() => {
+                        timer = null;
+                        const video = findMainVideoElement();
+                        if (!video) return;
+
+                        if (video.paused) {
+                            const promise = video.play();
+                            if (promise && typeof promise.catch === 'function') promise.catch(() => {});
+                        } else {
+                            video.pause();
+                        }
+                    }, CLICK_TOGGLE_DELAY_MS);
+                } catch (e) {}
+            },
+            true
+        );
+    };
+
+    const requestFullscreenSafe = (element) => {
+        if (!element) return false;
+
+        const request =
+            element.requestFullscreen ||
+            element.webkitRequestFullscreen ||
+            element.msRequestFullscreen ||
+            element.mozRequestFullScreen ||
+            element.webkitRequestFullScreen;
+
+        if (typeof request !== 'function') return false;
+
+        try {
+            const promise = request.call(element);
+            if (promise && typeof promise.catch === 'function') promise.catch(() => {});
+            return true;
+        } catch (e) {
+            return false;
+        }
+    };
+
+    const exitFullscreenSafe = () => {
+        const exit = document.exitFullscreen || document.webkitExitFullscreen || document.msExitFullscreen || document.mozCancelFullScreen;
+        if (typeof exit !== 'function') return false;
+
+        try {
+            const promise = exit.call(document);
+            if (promise && typeof promise.catch === 'function') promise.catch(() => {});
+            return true;
+        } catch (e) {
+            return false;
+        }
+    };
+
+    const installNativeFullscreenHijack = () => {
+        if (!FORCE_NATIVE_VIDEO_FULLSCREEN) return;
+        if (window.__yfsp_native_fullscreen_installed) return;
+        window.__yfsp_native_fullscreen_installed = true;
+
+        const isFullscreenToggleTarget = (target) => {
+            if (!target || typeof target.closest !== 'function') return false;
+
+            // The site uses <vg-fullscreen> with a div[role=button][aria-label=fullscreen].
+            if (target.closest('vg-fullscreen')) return true;
+            const roleButton = target.closest('[role="button"][aria-label="fullscreen"]');
+            return Boolean(roleButton);
+        };
+
+        document.addEventListener(
+            'click',
+            (event) => {
+                try {
+                    if (!event || !event.isTrusted) return;
+                    if (event.button !== 0) return;
+                    if (!isFullscreenToggleTarget(event.target)) return;
+
+                    const video = findMainVideoElement();
+                    if (!video) return;
+
+                    // Toggle fullscreen on the <video> element itself to minimize DOM overlays and help driver-side VSR detection.
+                    if (document.fullscreenElement || document.webkitFullscreenElement || document.msFullscreenElement) {
+                        event.preventDefault();
+                        event.stopImmediatePropagation();
+                        exitFullscreenSafe();
+                        return;
+                    }
+
+                    const ok = requestFullscreenSafe(video);
+                    if (!ok) return;
+
+                    event.preventDefault();
+                    event.stopImmediatePropagation();
+                } catch (e) {}
+            },
+            true
+        );
     };
 
     const findAngularComponent = (selector, matcher) => {
@@ -688,6 +917,9 @@
         ensureStyle();
         hideAds();
         observeDom();
+        installFullscreenClassObserver();
+        installClickToggle();
+        installNativeFullscreenHijack();
         hookAngular();
     };
 
