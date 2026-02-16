@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         YFSP.TV Unlocker
 // @namespace    http://tampermonkey.net/
-// @version      1.5
+// @version      1.6
 // @description  Unlocks quality UI, danmu styles (color/type/font/avatar/location), and playback speed UI. Adds click-to-toggle play/pause. Improves NVIDIA RTX VSR compatibility by forcing fullscreen on the <video> element.
 // @author       YFSP Analyst
 // @match        *://*.yfsp.tv/*
@@ -443,11 +443,17 @@
                         return;
                     }
 
+                    const video = findMainVideoElement();
+                    if (!video) return;
+                    const pausedBeforeClick = video.paused;
+
                     cancelPendingToggle();
                     timer = setTimeout(() => {
                         timer = null;
-                        const video = findMainVideoElement();
-                        if (!video) return;
+                        if (!video.isConnected) return;
+
+                        // If the site already handled this click, don't toggle again.
+                        if (video.paused !== pausedBeforeClick) return;
 
                         if (video.paused) {
                             const promise = video.play();
