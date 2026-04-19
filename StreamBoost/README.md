@@ -30,7 +30,7 @@
 * **在途合并**：播放器要的片段如果**已经在下载**，短暂等待直接复用结果，避免重复请求。
 * **内存 LRU 命中（fLoader）**：下载过的片段进入 LRU；命中后直接回填，几乎零延迟。
 * **淘汰过时在途**：level/sn 前进时，自动 `abort` 落后的在途下载，省流量也省时间。
-* **缓冲增强（VOD）**：放大 `maxBufferLength / maxMaxBufferLength / backBufferLength`，本地资源允许时尽量“多吃一点”，播放更丝滑。
+* **缓冲增强（VOD）**：放大 `maxBufferLength / maxMaxBufferLength / maxBufferSize / backBufferLength`，本地资源允许时尽量“多吃一点”，播放更丝滑。
 * **按站点启停 + 全局开关**：菜单一键控制；支持 **黑名单 JSON**（含 `*.domain.com` 通配）。
 * **同源 iframe 自动注入**：顶层与同源 iframe 一并受益（跨域 iframe 依赖 `@match` 自注入）。
 * **调试日志**：打开后关键决策全可见，排查问题更直观。
@@ -97,7 +97,7 @@
 | `HLS_BIGBUF_VOD_BUFFER_SEC`      | 点播前向缓冲秒（60-3600）     | `180`（低内存设备）或 `600` |
 | `HLS_BIGBUF_BACK_BUFFER_SEC`     | 回看缓冲秒（0-1800）        | `180` |
 | `HLS_BIGBUF_MAX_MAX_BUFFER_SEC`  | 最大缓冲上限秒数 | `1800` |
-| `HLS_BIGBUF_MAX_MEM_MB`          | LRU 内存上限 MB（16-512）  | `64/128/192`（按设备内存） |
+| `HLS_BIGBUF_MAX_MEM_MB`          | LRU 内存与 HLS `maxBufferSize` 上限 MB（16-512）  | `64/128/192`（按设备内存） |
 
 ### 快速验证（手动）
 
@@ -122,7 +122,7 @@
 * **403 / CORS 怎么办？**
   预取优先原生 XHR，并把机会交给站点 `xhrSetup`；若资源服务器不允许跨域，仍需 CORS 许可。
 * **会不会很占内存？**
-  LRU 缓存默认按设备内存自适应上限，超限就逐段淘汰；也可在 `⚙️ 参数配置页` 调整 `HLS_BIGBUF_MAX_MEM_MB`。
+  LRU 缓存和 HLS `maxBufferSize` 默认按设备内存自适应上限，超限就逐段淘汰；也可在 `⚙️ 参数配置页` 调整 `HLS_BIGBUF_MAX_MEM_MB`。
 
 ---
 

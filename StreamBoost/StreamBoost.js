@@ -3,7 +3,7 @@
 // @namespace    streamboost
 // @icon         https://image.suysker.xyz/i/2023/10/09/artworks-QOnSW1HR08BDMoe9-GJTeew-t500x500.webp
 // @namespace    http://tampermonkey.net/
-// @version      1.1.2
+// @version      1.1.3
 // @description  通用流媒体加速：加大缓冲、并发预取、内存命中、在途合并、按站点启停、修复部分站点自定义 Loader 导致的串行；当前覆盖 HLS.js，后续可扩展至其它播放器/协议。
 // @match        *://*/*
 // @run-at       document-start
@@ -62,7 +62,7 @@
     { group: '缓冲与内存', type: 'number', key: LS_VOD_BUFFER_SEC_KEY, label: 'VOD 前向缓冲（秒）', def: DEFAULT_VOD_BUFFER_SEC, min: 60, max: 3600, step: 30 },
     { group: '缓冲与内存', type: 'number', key: LS_BACK_BUFFER_SEC_KEY, label: '回看缓冲（秒）', def: 180, min: 0, max: 1800, step: 30 },
     { group: '缓冲与内存', type: 'number', key: LS_MAX_MAX_BUFFER_SEC_KEY, label: '最大缓冲上限（秒）', def: 1800, min: 120, max: 7200, step: 60 },
-    { group: '缓冲与内存', type: 'number', key: LS_MAX_MEM_MB_KEY, label: 'LRU 内存上限（MB）', def: DEFAULT_MAX_MEM_MB, min: 16, max: 512, step: 8 },
+    { group: '缓冲与内存', type: 'number', key: LS_MAX_MEM_MB_KEY, label: 'LRU/MSE 缓冲上限（MB）', def: DEFAULT_MAX_MEM_MB, min: 16, max: 512, step: 8 },
     { group: '请求策略+常规开关', type: 'bool', key: LS_PREFETCH_KEY, label: '并发预取', def: true },
     { group: '请求策略+常规开关', type: 'bool', key: LS_CACHE_KEY, label: '内存命中 fLoader', def: true },
     { group: '请求策略+常规开关', type: 'number', key: LS_PREFETCH_TIMEOUT_MS_KEY, label: '预取超时（ms）', def: 15000, min: 1000, max: 120000, step: 500 },
@@ -371,8 +371,23 @@
     })();
     const MAX_MEM_MB = readIntLS('HLS_BIGBUF_MAX_MEM_MB', DEFAULT_MAX_MEM_MB, 16, 512);
     const MAX_MEM_BYTES = MAX_MEM_MB * 1024 * 1024;
+    const MIN_MSE_BUFFER_BYTES = 60 * 1000 * 1000;
+    const MSE_BUFFER_BYTES = Math.max(MIN_MSE_BUFFER_BYTES, MAX_MEM_BYTES);
     const log  = (...a)=>{ if (DEBUG) console.log('[HLS BigBuffer]', ...a); };
     const warn = (...a)=>{ console.warn('[HLS BigBuffer]', ...a); };
+    function enforceMinNumber(value, minimum) {
+      const num = Number(value);
+      return Number.isFinite(num) ? Math.max(num, minimum) : minimum;
+    }
+    function buildHlsBufferConfig(baseConfig = {}) {
+      return {
+        maxBufferLength: enforceMinNumber(baseConfig.maxBufferLength, VOD_BUFFER_SEC),
+        maxMaxBufferLength: enforceMinNumber(baseConfig.maxMaxBufferLength, MAX_MAX_BUFFER_SEC),
+        maxBufferSize: enforceMinNumber(baseConfig.maxBufferSize, MSE_BUFFER_BYTES),
+        startFragPrefetch: true,
+        backBufferLength: enforceMinNumber(baseConfig.backBufferLength, BACK_BUFFER_SEC)
+      };
+    }
     function cloneAB(input) {
       if (!input) return null;
       if (input instanceof ArrayBuffer) return input.slice(0);
@@ -820,19 +835,14 @@
       try{
         if(!OriginalHls || OriginalHls.__HLS_BIGBUF_PATCHED__ || !isCtor(OriginalHls)) return OriginalHls;
         window.HlsOriginal = window.__HlsOriginal = OriginalHls;
-        const overrides = {
-          maxBufferLength: VOD_BUFFER_SEC,
-          maxMaxBufferLength: MAX_MAX_BUFFER_SEC,
-          startFragPrefetch: true,
-          backBufferLength: BACK_BUFFER_SEC
-        };
         try {
-          if (OriginalHls.DefaultConfig) Object.assign(OriginalHls.DefaultConfig, overrides);
+          if (OriginalHls.DefaultConfig) Object.assign(OriginalHls.DefaultConfig, buildHlsBufferConfig(OriginalHls.DefaultConfig));
           log('DefaultConfig applied', OriginalHls.DefaultConfig);
         } catch(e){ log('DefaultConfig assign failed (frozen?)', e); }
         class PatchedHls extends OriginalHls {
           constructor(userConfig = {}){
-            const enforced = Object.assign({}, overrides, userConfig);
+            if (!userConfig || typeof userConfig !== 'object') userConfig = {};
+            const enforced = Object.assign({}, userConfig, buildHlsBufferConfig(userConfig));
             if (ENABLE_MEMCACHE) {
               const UserLoader = userConfig.fLoader || userConfig.loader;
               if (UserLoader) {
@@ -855,13 +865,11 @@
                 const isLive = !!data?.details?.live;
                 if (!isLive) {
                   const c = this.config;
-                  c.maxBufferLength    = Math.max(c.maxBufferLength ?? 0, VOD_BUFFER_SEC);
-                  c.maxMaxBufferLength = Math.max(c.maxMaxBufferLength ?? 0, MAX_MAX_BUFFER_SEC);
-                  c.backBufferLength   = Math.max(c.backBufferLength ?? 0, BACK_BUFFER_SEC);
-                  c.startFragPrefetch  = true;
+                  Object.assign(c, buildHlsBufferConfig(c));
                   log('LEVEL_LOADED → ensured VOD config', {
                     maxBufferLength: c.maxBufferLength,
                     maxMaxBufferLength: c.maxMaxBufferLength,
+                    maxBufferSize: c.maxBufferSize,
                     backBufferLength: c.backBufferLength,
                     startFragPrefetch: c.startFragPrefetch
                   });
