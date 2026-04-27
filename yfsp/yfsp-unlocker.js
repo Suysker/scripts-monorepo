@@ -101,7 +101,6 @@ vg-quality-selector .vip-label {
     max-height: none !important;
     object-fit: contain !important;
     background: #000 !important;
-    transform: none !important;
     filter: none !important;
     opacity: 1 !important;
 }
