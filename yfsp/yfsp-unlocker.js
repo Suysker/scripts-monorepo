@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         YFSP.TV Unlocker
 // @namespace    http://tampermonkey.net/
-// @version      1.6
-// @description  Unlocks quality UI, danmu styles (color/type/font/avatar/location), and playback speed UI. Adds click-to-toggle play/pause. Improves NVIDIA RTX VSR compatibility by forcing fullscreen on the <video> element.
+// @version      1.7
+// @description  Unlocks quality UI, danmu styles (color/type/font/avatar/location), and playback speed UI. Adds click-to-toggle play/pause. Uses player-container fullscreen to preserve danmu while keeping RTX VSR compatibility hints.
 // @author       YFSP Analyst
 // @match        *://*.yfsp.tv/*
 // @match        *://*.yifan.tv/*
@@ -25,11 +25,94 @@
     const BOOTSTRAP_INTERVAL_MS = 2000;
     const CLICK_TOGGLE_DELAY_MS = 250;
     const MIN_CLICK_TOGGLE_VIDEO_EDGE_PX = 120;
-    const FORCE_NATIVE_VIDEO_FULLSCREEN = true;
+    const FULLSCREEN_CONTROL_REVEAL_MS = 2500;
+    const FULLSCREEN_TARGET_CLASS = 'yfsp-fullscreen-target';
+    const FULLSCREEN_CONTROL_VISIBLE_CLASS = 'yfsp-controls-visible';
+    const PLAYER_CONTAINER_SELECTOR = 'aa-videoplayer, vg-player#main-player, .video-container';
 
     const MATCH_USER = [/\/api\/payment\/getPaymentInfo/i, /\/api\/user\/info/i];
     const MATCH_PLAY = [/\/v3\/video\/play/i, /\/v3\/video\/detail/i];
     const STYLE_ID = 'yfsp-unlocker-style';
+    const STYLE_TEXT = String.raw`
+iframe[src*="google"],
+iframe[src*="doubleclick"],
+.ad,
+.ads,
+[id*="ad_"],
+[class*="ad-"],
+.use-coin-box,
+#coin-or-upgrade-to-skip-ad,
+.dn-dialog-background,
+#dn_iframe {
+    display: none !important;
+}
+
+vg-quality-selector .vip-label {
+    display: none !important;
+}
+
+.quality-btn {
+    opacity: 1 !important;
+    pointer-events: auto !important;
+}
+
+.${FULLSCREEN_TARGET_CLASS}:fullscreen,
+.${FULLSCREEN_TARGET_CLASS}:-webkit-full-screen {
+    display: block !important;
+    width: 100vw !important;
+    height: 100vh !important;
+    min-width: 100vw !important;
+    min-height: 100vh !important;
+    max-width: none !important;
+    max-height: none !important;
+    margin: 0 !important;
+    padding: 0 !important;
+    background: #000 !important;
+    overflow: hidden !important;
+    position: relative !important;
+    inset: 0 !important;
+}
+
+.${FULLSCREEN_TARGET_CLASS}:fullscreen::backdrop,
+.${FULLSCREEN_TARGET_CLASS}:-webkit-full-screen::backdrop {
+    background: #000 !important;
+}
+
+.${FULLSCREEN_TARGET_CLASS}:fullscreen :is(vg-player, .video-container, .video-box),
+.${FULLSCREEN_TARGET_CLASS}:-webkit-full-screen :is(vg-player, .video-container, .video-box) {
+    display: block !important;
+    width: 100% !important;
+    height: 100% !important;
+    min-height: 100% !important;
+    max-width: none !important;
+    max-height: none !important;
+    margin: 0 !important;
+    padding: 0 !important;
+    position: relative !important;
+    background: #000 !important;
+    overflow: hidden !important;
+}
+
+.${FULLSCREEN_TARGET_CLASS}:fullscreen video,
+.${FULLSCREEN_TARGET_CLASS}:-webkit-full-screen video {
+    width: 100% !important;
+    height: 100% !important;
+    max-width: none !important;
+    max-height: none !important;
+    object-fit: contain !important;
+    background: #000 !important;
+    transform: none !important;
+    filter: none !important;
+    opacity: 1 !important;
+}
+
+.${FULLSCREEN_TARGET_CLASS}.${FULLSCREEN_CONTROL_VISIBLE_CLASS}:fullscreen :is(vg-controls, vg-scrub-bar, vg-quality-selector),
+.${FULLSCREEN_TARGET_CLASS}.${FULLSCREEN_CONTROL_VISIBLE_CLASS}:-webkit-full-screen :is(vg-controls, vg-scrub-bar, vg-quality-selector) {
+    visibility: visible !important;
+    opacity: 1 !important;
+    z-index: 2147483646 !important;
+}
+`;
 
     const normalizeUrl = (input) => {
         try {
@@ -300,17 +383,7 @@
 
         const style = document.createElement('style');
         style.id = STYLE_ID;
-        style.textContent = [
-            'iframe[src*="google"] { display: none !important; }',
-            'iframe[src*="doubleclick"] { display: none !important; }',
-            '.ad, .ads, [id*="ad_"], [class*="ad-"] { display: none !important; }',
-            '.use-coin-box { display: none !important; }',
-            '#coin-or-upgrade-to-skip-ad { display: none !important; }',
-            '.dn-dialog-background { display: none !important; }',
-            '#dn_iframe { display: none !important; }',
-            'vg-quality-selector .vip-label { display: none !important; }',
-            '.quality-btn { opacity: 1 !important; pointer-events: auto !important; }'
-        ].join('\n');
+        style.append(STYLE_TEXT);
 
         (document.head || document.documentElement).appendChild(style);
     };
@@ -384,6 +457,30 @@
         return best;
     };
 
+    const findFullscreenContainer = (video) => {
+        if (!video || typeof video.closest !== 'function') return null;
+
+        const candidates = [
+            video.closest('aa-videoplayer'),
+            video.closest('vg-player#main-player'),
+            video.closest('.video-container'),
+            video.closest(PLAYER_CONTAINER_SELECTOR),
+            video.parentElement
+        ];
+
+        return (
+            candidates.find(
+                (element) =>
+                    element &&
+                    element.nodeType === Node.ELEMENT_NODE &&
+                    element.isConnected &&
+                    element !== document.documentElement &&
+                    element !== document.body &&
+                    element.contains(video)
+            ) || null
+        );
+    };
+
     const shouldIgnoreToggleClickTarget = (target) => {
         if (!target || typeof target.closest !== 'function') return false;
 
@@ -434,7 +531,7 @@
                     if (event.button !== 0) return;
                     if (event.metaKey || event.ctrlKey || event.shiftKey || event.altKey) return;
                     if (!event.target || typeof event.target.closest !== 'function') return;
-                    if (!event.target.closest('aa-videoplayer, vg-player#main-player, .video-container')) return;
+                    if (!event.target.closest(PLAYER_CONTAINER_SELECTOR)) return;
                     if (shouldIgnoreToggleClickTarget(event.target)) return;
 
                     // Suppress click-to-toggle when the user double clicks (e.g., fullscreen), matching typical players.
@@ -502,10 +599,70 @@
         }
     };
 
-    const installNativeFullscreenHijack = () => {
-        if (!FORCE_NATIVE_VIDEO_FULLSCREEN) return;
-        if (window.__yfsp_native_fullscreen_installed) return;
-        window.__yfsp_native_fullscreen_installed = true;
+    const getFullscreenElement = () =>
+        document.fullscreenElement || document.webkitFullscreenElement || document.msFullscreenElement || document.mozFullScreenElement || null;
+
+    const getFullscreenPlayerContainer = () => {
+        const element = getFullscreenElement();
+        return element && element.classList && element.classList.contains(FULLSCREEN_TARGET_CLASS) ? element : null;
+    };
+
+    const installFullscreenControlReveal = () => {
+        if (window.__yfsp_fullscreen_control_reveal_installed) return;
+        window.__yfsp_fullscreen_control_reveal_installed = true;
+
+        let revealTimer = null;
+
+        const clearRevealTimer = () => {
+            if (!revealTimer) return;
+            clearTimeout(revealTimer);
+            revealTimer = null;
+        };
+
+        const clearFullscreenClasses = () => {
+            clearRevealTimer();
+            document.querySelectorAll(`.${FULLSCREEN_TARGET_CLASS}, .${FULLSCREEN_CONTROL_VISIBLE_CLASS}`).forEach((element) => {
+                element.classList.remove(FULLSCREEN_TARGET_CLASS, FULLSCREEN_CONTROL_VISIBLE_CLASS);
+            });
+        };
+
+        const revealControls = () => {
+            const container = getFullscreenPlayerContainer();
+            if (!container) return;
+
+            container.classList.add(FULLSCREEN_CONTROL_VISIBLE_CLASS);
+            clearRevealTimer();
+            revealTimer = setTimeout(() => {
+                container.classList.remove(FULLSCREEN_CONTROL_VISIBLE_CLASS);
+                revealTimer = null;
+            }, FULLSCREEN_CONTROL_REVEAL_MS);
+        };
+
+        const syncFullscreenState = () => {
+            if (getFullscreenPlayerContainer()) {
+                revealControls();
+                return;
+            }
+
+            clearFullscreenClasses();
+        };
+
+        ['fullscreenchange', 'webkitfullscreenchange', 'mozfullscreenchange', 'MSFullscreenChange'].forEach((eventName) => {
+            document.addEventListener(eventName, syncFullscreenState, true);
+        });
+
+        ['fullscreenerror', 'webkitfullscreenerror', 'mozfullscreenerror', 'MSFullscreenError'].forEach((eventName) => {
+            document.addEventListener(eventName, clearFullscreenClasses, true);
+        });
+
+        ['pointermove', 'pointerdown', 'touchstart', 'keydown'].forEach((eventName) => {
+            document.addEventListener(eventName, revealControls, true);
+        });
+    };
+
+    const installContainerFullscreenHijack = () => {
+        if (window.__yfsp_container_fullscreen_installed) return;
+        window.__yfsp_container_fullscreen_installed = true;
 
         const isFullscreenToggleTarget = (target) => {
             if (!target || typeof target.closest !== 'function') return false;
@@ -526,8 +683,10 @@
 
                     const video = findMainVideoElement();
                     if (!video) return;
+                    const container = findFullscreenContainer(video);
+                    if (!container) return;
 
-                    // Toggle fullscreen on the <video> element itself to minimize DOM overlays and help driver-side VSR detection.
+                    // Fullscreen the player container so site danmu and controls stay in the fullscreen tree.
                     if (document.fullscreenElement || document.webkitFullscreenElement || document.msFullscreenElement) {
                         event.preventDefault();
                         event.stopImmediatePropagation();
@@ -535,8 +694,12 @@
                         return;
                     }
 
-                    const ok = requestFullscreenSafe(video);
-                    if (!ok) return;
+                    container.classList.add(FULLSCREEN_TARGET_CLASS);
+                    const ok = requestFullscreenSafe(container);
+                    if (!ok) {
+                        container.classList.remove(FULLSCREEN_TARGET_CLASS);
+                        return;
+                    }
 
                     event.preventDefault();
                     event.stopImmediatePropagation();
@@ -891,7 +1054,8 @@
         hideAds();
         observeDom();
         installClickToggle();
-        installNativeFullscreenHijack();
+        installFullscreenControlReveal();
+        installContainerFullscreenHijack();
         hookAngular();
     };
 
