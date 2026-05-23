@@ -3,7 +3,7 @@
 // @description  按住"→"键倍速播放，按住"←"键减速播放，松开恢复原来的倍速，轻松追剧，看视频更灵活，还能快进/跳过大部分网站的广告！~ 支持用户单独配置倍速和秒数，并可根据根域名启用或禁用脚本
 // @icon         https://image.suysker.xyz/i/2023/10/09/artworks-QOnSW1HR08BDMoe9-GJTeew-t500x500.webp
 // @namespace    http://tampermonkey.net/
-// @version      1.1.0
+// @version      1.1.1
 // @author       Suysker
 // @match        http://*/*
 // @match        https://*/*
@@ -325,12 +325,23 @@
      * @returns {boolean} - True if visible, else false.
      */
     const isVideoVisible = (video) => {
+        if (!video || !video.isConnected) return false;
+
+        const style = window.getComputedStyle(video);
+        if (style.display === 'none' || style.visibility === 'hidden' || style.opacity === '0') {
+            return false;
+        }
+
         const rect = video.getBoundingClientRect();
+        const viewportHeight = window.innerHeight || document.documentElement.clientHeight;
+        const viewportWidth = window.innerWidth || document.documentElement.clientWidth;
         return (
-            rect.top >= 0 &&
-            rect.left >= 0 &&
-            rect.bottom <= (window.innerHeight || document.documentElement.clientHeight) &&
-            rect.right <= (window.innerWidth || document.documentElement.clientWidth)
+            rect.width > 0 &&
+            rect.height > 0 &&
+            rect.bottom > 0 &&
+            rect.right > 0 &&
+            rect.top < viewportHeight &&
+            rect.left < viewportWidth
         );
     };
 
@@ -380,26 +391,124 @@
         log('从缓存中移除视频:', removedVideos);
     };
 
+    const isSearchableVideoRoot = (node) => {
+        return node && (
+            node.nodeType === Node.DOCUMENT_NODE ||
+            node.nodeType === Node.DOCUMENT_FRAGMENT_NODE ||
+            node.nodeType === Node.ELEMENT_NODE
+        );
+    };
+
+    const addVideoCandidate = (videos, seen, node) => {
+        if (!node || node.nodeType !== Node.ELEMENT_NODE) return;
+        if ((node.tagName || '').toLowerCase() !== 'video') return;
+        if (seen.has(node)) return;
+        seen.add(node);
+        videos.push(node);
+    };
+
+    const getQueryableElements = (root) => {
+        if (!root || typeof root.querySelectorAll !== 'function') return [];
+        const elements = Array.from(root.querySelectorAll('*'));
+        if (root.nodeType === Node.ELEMENT_NODE) {
+            elements.unshift(root);
+        }
+        return elements;
+    };
+
+    /**
+     * Finds video elements in normal DOM and open Shadow DOM roots.
+     * @param {Node} root - The root node to search within.
+     * @returns {HTMLVideoElement[]} - Array of found video elements.
+     */
+    const collectVideosDeep = (root = document) => {
+        const videos = [];
+        const seenVideos = new Set();
+        const visitedRoots = new WeakSet();
+        const roots = [root];
+
+        while (roots.length > 0) {
+            const currentRoot = roots.pop();
+            if (!isSearchableVideoRoot(currentRoot) || visitedRoots.has(currentRoot)) continue;
+            visitedRoots.add(currentRoot);
+
+            addVideoCandidate(videos, seenVideos, currentRoot);
+
+            if (typeof currentRoot.querySelectorAll === 'function') {
+                currentRoot.querySelectorAll('video').forEach(video => {
+                    addVideoCandidate(videos, seenVideos, video);
+                });
+            }
+
+            getQueryableElements(currentRoot).forEach(element => {
+                if (element.shadowRoot) {
+                    roots.push(element.shadowRoot);
+                }
+            });
+        }
+
+        return videos;
+    };
+
+    const findOpenShadowRootsDeep = (root) => {
+        const shadowRoots = [];
+        const visitedRoots = new WeakSet();
+        const roots = [root];
+
+        while (roots.length > 0) {
+            const currentRoot = roots.pop();
+            if (!isSearchableVideoRoot(currentRoot) || visitedRoots.has(currentRoot)) continue;
+            visitedRoots.add(currentRoot);
+
+            getQueryableElements(currentRoot).forEach(element => {
+                if (element.shadowRoot) {
+                    shadowRoots.push(element.shadowRoot);
+                    roots.push(element.shadowRoot);
+                }
+            });
+        }
+
+        return shadowRoots;
+    };
+
+    const observeVideoRootsDeep = (root, observer, observedRoots) => {
+        if (!root || !observer || !observedRoots) return;
+
+        const observeRoot = (targetRoot) => {
+            if (!isSearchableVideoRoot(targetRoot) || observedRoots.has(targetRoot)) return;
+            observer.observe(targetRoot, { childList: true, subtree: true });
+            observedRoots.add(targetRoot);
+        };
+
+        observeRoot(root);
+        findOpenShadowRootsDeep(root).forEach(observeRoot);
+    };
+
+    const getVideoArea = (video) => {
+        const rect = video.getBoundingClientRect();
+        return rect.width * rect.height;
+    };
+
+    const getLargestVisibleVideo = (videos) => {
+        return videos
+            .filter(isVideoVisible)
+            .sort((a, b) => getVideoArea(b) - getVideoArea(a))[0] || null;
+    };
+
     /**
      * Finds all video elements within a given node.
      * @param {Node} node - The root node to search within.
      * @returns {HTMLVideoElement[]} - Array of found video elements.
      */
     const findVideosRecursively = (node) => {
-        if (node.nodeType !== Node.ELEMENT_NODE) return [];
-        const videos = [];
-        if (node.tagName.toLowerCase() === 'video') {
-            videos.push(node);
-        }
-        videos.push(...node.querySelectorAll('video'));
-        return videos;
+        return collectVideosDeep(node);
     };
 
     /**
      * Caches all video elements currently present on the page.
      */
     const cacheAllVideos = () => {
-        const allVideos = Array.from(document.getElementsByTagName('video'));
+        const allVideos = collectVideosDeep(document);
         initVideoListeners(allVideos);
         log('缓存所有视频:', allVideos);
     };
@@ -416,11 +525,19 @@
         }
 
         // 如果 lastPlayedVideo 不存在或不可见，检查是否有其他视频正在播放
-        const allVideos = Array.from(document.getElementsByTagName('video'));
-        const playingVideo = allVideos.find(isVideoPlaying);
+        const allVideos = collectVideosDeep(document);
+        initVideoListeners(allVideos);
+        const visiblePlayingVideo = allVideos.find(video => isVideoVisible(video) && isVideoPlaying(video));
+        const playingVideo = visiblePlayingVideo || allVideos.find(isVideoPlaying);
         if (playingVideo) {
             log('找到其他正在播放的视频:', playingVideo);
             return playingVideo;
+        }
+
+        const visibleVideo = getLargestVisibleVideo(allVideos);
+        if (visibleVideo) {
+            log('找到可见视频:', visibleVideo);
+            return visibleVideo;
         }
 
         // 如果没有合适的视频，返回 null 并记录状态
@@ -655,10 +772,12 @@
             cacheAllVideos();
 
             // Observe DOM mutations to handle dynamically added or removed videos
+            const observedVideoRoots = new WeakSet();
             const observer = new MutationObserver((mutations) => {
                 mutations.forEach((mutation) => {
                     const addedNodes = Array.from(mutation.addedNodes);
                     addedNodes.forEach(node => {
+                        observeVideoRootsDeep(node, observer, observedVideoRoots);
                         const addedVideos = findVideosRecursively(node); // 查找新增节点中的 video
                         if (addedVideos.length > 0) {
                             initVideoListeners(addedVideos); // 初始化新增视频
@@ -676,7 +795,7 @@
                 });
             });
 
-            observer.observe(document.body, { childList: true, subtree: true });
+            observeVideoRootsDeep(document.documentElement || document.body, observer, observedVideoRoots);
             log('MutationObserver 已启动');
 
             // 配置进度条的焦点行为
