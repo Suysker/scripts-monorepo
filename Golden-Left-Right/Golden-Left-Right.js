@@ -3,7 +3,7 @@
 // @description  按住"→"键倍速播放，按住"←"键减速播放，松开恢复原来的倍速，轻松追剧，看视频更灵活，还能快进/跳过大部分网站的广告！~ 支持用户单独配置倍速和秒数，并可根据根域名启用或禁用脚本
 // @icon         https://image.suysker.xyz/i/2023/10/09/artworks-QOnSW1HR08BDMoe9-GJTeew-t500x500.webp
 // @namespace    http://tampermonkey.net/
-// @version      1.1.1
+// @version      1.1.2
 // @author       Suysker
 // @match        http://*/*
 // @match        https://*/*
@@ -28,11 +28,11 @@
     const SETTING_BOTH_KEYS_TIME_KEY = 'bothKeysJumpTime';
     const GLR_CFG_MODAL_ID = 'glr-config-modal';
     const GLR_CFG_STYLE_ID = 'glr-config-style';
+    const VIDEO_REGISTRY_REFRESH_DELAY_MS = 100;
 
     // -------------------- State Variables --------------------
     let keyboardEventsRegistered = false;  // 确保键盘事件只注册一次
     const debug = false;                   // 控制日志的输出，正式环境关闭
-    let cachedVideos = [];                 // 缓存视频列表
 
     const state = {
         playbackRate: DEFAULT_RATE,        // 播放倍速
@@ -43,6 +43,21 @@
         originalPlaybackRate: 1,           // 存储原来的播放速度
         rightKeyDownCount: 0,              // 追踪右键按下次数
         leftKeyDownCount: 0                // 追踪左键按下次数
+    };
+
+    const videoRegistry = {
+        candidates: [],
+        initializedVideos: new WeakSet(),
+        lastPlayedVideo: null,
+        dirty: true,
+        refreshScheduled: false,
+        observedRootCount: 0,
+        scanCount: 0
+    };
+
+    const videoRootObserver = {
+        observer: null,
+        running: false
     };
 
     // -------------------- Utility Functions --------------------
@@ -354,43 +369,6 @@
         return video && !video.paused && video.currentTime > 0;
     };
 
-    /**
-     * Adds event listeners to a video element to track playback.
-     * @param {HTMLVideoElement} video - The video element.
-     */
-    const addPlayEventListeners = (video) => {
-        video.addEventListener('play', () => {
-            state.lastPlayedVideo = video; // 仅在视频播放时更新
-            log('更新 lastPlayedVideo: 当前播放的视频', video);
-        });
-
-        video.addEventListener('remove', () => {
-            removeFromCache([video]);
-        });
-    };
-
-    /**
-     * Initializes event listeners for a list of video elements.
-     * @param {HTMLVideoElement[]} videos - Array of video elements.
-     */
-    const initVideoListeners = (videos) => {
-        videos.forEach(video => {
-            if (!cachedVideos.includes(video)) {  // 避免重复添加
-                cachedVideos.push(video);         // 缓存新视频
-                addPlayEventListeners(video);       // 为每个新视频添加监听
-            }
-        });
-    };
-
-    /**
-     * Removes video elements from the cache.
-     * @param {HTMLVideoElement[]} removedVideos - Array of video elements to remove.
-     */
-    const removeFromCache = (removedVideos) => {
-        cachedVideos = cachedVideos.filter(video => !removedVideos.includes(video));
-        log('从缓存中移除视频:', removedVideos);
-    };
-
     const isSearchableVideoRoot = (node) => {
         return node && (
             node.nodeType === Node.DOCUMENT_NODE ||
@@ -399,21 +377,52 @@
         );
     };
 
-    const addVideoCandidate = (videos, seen, node) => {
-        if (!node || node.nodeType !== Node.ELEMENT_NODE) return;
-        if ((node.tagName || '').toLowerCase() !== 'video') return;
-        if (seen.has(node)) return;
-        seen.add(node);
-        videos.push(node);
+    const isVideoElement = (node) => {
+        return node && node.nodeType === Node.ELEMENT_NODE && (node.tagName || '').toLowerCase() === 'video';
     };
 
-    const getQueryableElements = (root) => {
-        if (!root || typeof root.querySelectorAll !== 'function') return [];
-        const elements = Array.from(root.querySelectorAll('*'));
+    const getRootDocument = (root) => {
+        if (root && root.nodeType === Node.DOCUMENT_NODE) return root;
+        return root?.ownerDocument || document;
+    };
+
+    const visitLightDomElements = (root, visitor) => {
+        if (!isSearchableVideoRoot(root)) return;
+
         if (root.nodeType === Node.ELEMENT_NODE) {
-            elements.unshift(root);
+            visitor(root);
         }
-        return elements;
+
+        const walker = getRootDocument(root).createTreeWalker(root, NodeFilter.SHOW_ELEMENT);
+        let element = walker.nextNode();
+        while (element) {
+            visitor(element);
+            element = walker.nextNode();
+        }
+    };
+
+    const visitElementsDeep = (root, visitor) => {
+        const roots = [root];
+        const visitedRoots = new WeakSet();
+
+        while (roots.length > 0) {
+            const currentRoot = roots.pop();
+            if (!isSearchableVideoRoot(currentRoot) || visitedRoots.has(currentRoot)) continue;
+            visitedRoots.add(currentRoot);
+
+            visitLightDomElements(currentRoot, (element) => {
+                visitor(element, currentRoot);
+                if (element.shadowRoot) {
+                    roots.push(element.shadowRoot);
+                }
+            });
+        }
+    };
+
+    const addVideoCandidate = (videos, seenVideos, video) => {
+        if (!isVideoElement(video) || seenVideos.has(video)) return;
+        seenVideos.add(video);
+        videos.push(video);
     };
 
     /**
@@ -423,65 +432,31 @@
      */
     const collectVideosDeep = (root = document) => {
         const videos = [];
-        const seenVideos = new Set();
-        const visitedRoots = new WeakSet();
-        const roots = [root];
+        const seenVideos = new WeakSet();
 
-        while (roots.length > 0) {
-            const currentRoot = roots.pop();
-            if (!isSearchableVideoRoot(currentRoot) || visitedRoots.has(currentRoot)) continue;
-            visitedRoots.add(currentRoot);
-
-            addVideoCandidate(videos, seenVideos, currentRoot);
-
-            if (typeof currentRoot.querySelectorAll === 'function') {
-                currentRoot.querySelectorAll('video').forEach(video => {
-                    addVideoCandidate(videos, seenVideos, video);
-                });
-            }
-
-            getQueryableElements(currentRoot).forEach(element => {
-                if (element.shadowRoot) {
-                    roots.push(element.shadowRoot);
-                }
-            });
-        }
+        visitElementsDeep(root, (element) => {
+            addVideoCandidate(videos, seenVideos, element);
+        });
 
         return videos;
     };
 
-    const findOpenShadowRootsDeep = (root) => {
+    const collectOpenShadowRootsDeep = (root = document) => {
         const shadowRoots = [];
-        const visitedRoots = new WeakSet();
-        const roots = [root];
+        const seenRoots = new WeakSet();
 
-        while (roots.length > 0) {
-            const currentRoot = roots.pop();
-            if (!isSearchableVideoRoot(currentRoot) || visitedRoots.has(currentRoot)) continue;
-            visitedRoots.add(currentRoot);
-
-            getQueryableElements(currentRoot).forEach(element => {
-                if (element.shadowRoot) {
-                    shadowRoots.push(element.shadowRoot);
-                    roots.push(element.shadowRoot);
-                }
-            });
-        }
+        visitElementsDeep(root, (element) => {
+            if (!element.shadowRoot || seenRoots.has(element.shadowRoot)) return;
+            seenRoots.add(element.shadowRoot);
+            shadowRoots.push(element.shadowRoot);
+        });
 
         return shadowRoots;
     };
 
-    const observeVideoRootsDeep = (root, observer, observedRoots) => {
-        if (!root || !observer || !observedRoots) return;
-
-        const observeRoot = (targetRoot) => {
-            if (!isSearchableVideoRoot(targetRoot) || observedRoots.has(targetRoot)) return;
-            observer.observe(targetRoot, { childList: true, subtree: true });
-            observedRoots.add(targetRoot);
-        };
-
-        observeRoot(root);
-        findOpenShadowRootsDeep(root).forEach(observeRoot);
+    const markVideoRegistryDirty = (reason) => {
+        videoRegistry.dirty = true;
+        log('视频注册表已标记为 dirty:', reason);
     };
 
     const getVideoArea = (video) => {
@@ -490,26 +465,151 @@
     };
 
     const getLargestVisibleVideo = (videos) => {
-        return videos
-            .filter(isVideoVisible)
-            .sort((a, b) => getVideoArea(b) - getVideoArea(a))[0] || null;
+        let bestVideo = null;
+        let bestArea = 0;
+
+        videos.forEach(video => {
+            if (!isVideoVisible(video)) return;
+            const area = getVideoArea(video);
+            if (area > bestArea) {
+                bestArea = area;
+                bestVideo = video;
+            }
+        });
+
+        return bestVideo;
     };
 
-    /**
-     * Finds all video elements within a given node.
-     * @param {Node} node - The root node to search within.
-     * @returns {HTMLVideoElement[]} - Array of found video elements.
-     */
-    const findVideosRecursively = (node) => {
-        return collectVideosDeep(node);
+    const pruneDisconnectedVideos = () => {
+        videoRegistry.candidates = videoRegistry.candidates.filter(video => video.isConnected);
+
+        if (videoRegistry.lastPlayedVideo && !videoRegistry.lastPlayedVideo.isConnected) {
+            videoRegistry.lastPlayedVideo = null;
+        }
+        if (state.lastPlayedVideo && !state.lastPlayedVideo.isConnected) {
+            state.lastPlayedVideo = null;
+        }
+        if (state.pageVideo && !state.pageVideo.isConnected) {
+            state.pageVideo = null;
+        }
+    };
+
+    const registerVideo = (video) => {
+        if (!isVideoElement(video) || videoRegistry.initializedVideos.has(video)) return;
+
+        videoRegistry.initializedVideos.add(video);
+        video.addEventListener('play', () => {
+            videoRegistry.lastPlayedVideo = video;
+            state.lastPlayedVideo = video; // 保持原状态字段，避免扩大状态迁移范围
+            log('更新 lastPlayedVideo: 当前播放的视频', video);
+        });
+    };
+
+    const refreshVideoRegistry = (root = document) => {
+        const videos = collectVideosDeep(root).filter(video => video.isConnected);
+        videos.forEach(registerVideo);
+        videoRegistry.candidates = videos;
+        videoRegistry.dirty = false;
+        videoRegistry.scanCount++;
+        pruneDisconnectedVideos();
+        log('视频注册表已刷新:', videos);
+        return videos;
+    };
+
+    const getBestVideo = () => {
+        if (videoRegistry.dirty) {
+            refreshVideoRegistry(document);
+        } else {
+            pruneDisconnectedVideos();
+        }
+
+        const candidates = videoRegistry.candidates;
+        const lastPlayedVideo = videoRegistry.lastPlayedVideo || state.lastPlayedVideo;
+        if (lastPlayedVideo && isVideoVisible(lastPlayedVideo)) {
+            log('lastPlayedVideo 存在且可见');
+            return lastPlayedVideo;
+        }
+
+        const visiblePlayingVideo = candidates.find(video => isVideoVisible(video) && isVideoPlaying(video));
+        if (visiblePlayingVideo) {
+            log('找到可见且正在播放的视频:', visiblePlayingVideo);
+            return visiblePlayingVideo;
+        }
+
+        const playingVideo = candidates.find(isVideoPlaying);
+        if (playingVideo) {
+            log('找到其他正在播放的视频:', playingVideo);
+            return playingVideo;
+        }
+
+        const visibleVideo = getLargestVisibleVideo(candidates);
+        if (visibleVideo) {
+            log('找到可见视频:', visibleVideo);
+            return visibleVideo;
+        }
+
+        log('未找到合适的视频');
+        return null;
+    };
+
+    const rebuildObservedVideoRoots = () => {
+        const observer = videoRootObserver.observer;
+        if (!observer || !videoRootObserver.running) return;
+
+        observer.disconnect();
+
+        let observedCount = 0;
+        const observeRoot = (root) => {
+            if (!isSearchableVideoRoot(root)) return;
+            observer.observe(root, { childList: true, subtree: true });
+            observedCount++;
+        };
+
+        observeRoot(document.documentElement || document.body || document);
+        collectOpenShadowRootsDeep(document).forEach(observeRoot);
+        videoRegistry.observedRootCount = observedCount;
+        log('视频观察根已重建:', observedCount);
+    };
+
+    const scheduleVideoRegistryRefresh = () => {
+        if (videoRegistry.refreshScheduled) return;
+        videoRegistry.refreshScheduled = true;
+
+        const refresh = () => {
+            videoRegistry.refreshScheduled = false;
+            if (!videoRootObserver.running) return;
+            refreshVideoRegistry(document);
+            rebuildObservedVideoRoots();
+        };
+
+        if (typeof window.requestIdleCallback === 'function') {
+            window.requestIdleCallback(refresh, { timeout: VIDEO_REGISTRY_REFRESH_DELAY_MS });
+        } else {
+            window.setTimeout(refresh, VIDEO_REGISTRY_REFRESH_DELAY_MS);
+        }
+    };
+
+    const handleVideoRootMutations = (mutations) => {
+        const hasChildListChange = mutations.some(mutation => mutation.type === 'childList');
+        if (!hasChildListChange) return;
+
+        markVideoRegistryDirty('dom-mutation');
+        scheduleVideoRegistryRefresh();
+    };
+
+    const startVideoRootObserver = () => {
+        if (!videoRootObserver.observer) {
+            videoRootObserver.observer = new MutationObserver(handleVideoRootMutations);
+        }
+        videoRootObserver.running = true;
+        rebuildObservedVideoRoots();
     };
 
     /**
      * Caches all video elements currently present on the page.
      */
     const cacheAllVideos = () => {
-        const allVideos = collectVideosDeep(document);
-        initVideoListeners(allVideos);
+        const allVideos = refreshVideoRegistry(document);
         log('缓存所有视频:', allVideos);
     };
 
@@ -518,31 +618,7 @@
      * @returns {Promise<HTMLVideoElement|null>} - The selected video element or null.
      */
     const getOptimalPageVideo = () => {
-        // 检查 lastPlayedVideo 是否存在且可见，不检查是否正在播放
-        if (state.lastPlayedVideo && isVideoVisible(state.lastPlayedVideo)) {
-            log('lastPlayedVideo 存在且可见');
-            return state.lastPlayedVideo;
-        }
-
-        // 如果 lastPlayedVideo 不存在或不可见，检查是否有其他视频正在播放
-        const allVideos = collectVideosDeep(document);
-        initVideoListeners(allVideos);
-        const visiblePlayingVideo = allVideos.find(video => isVideoVisible(video) && isVideoPlaying(video));
-        const playingVideo = visiblePlayingVideo || allVideos.find(isVideoPlaying);
-        if (playingVideo) {
-            log('找到其他正在播放的视频:', playingVideo);
-            return playingVideo;
-        }
-
-        const visibleVideo = getLargestVisibleVideo(allVideos);
-        if (visibleVideo) {
-            log('找到可见视频:', visibleVideo);
-            return visibleVideo;
-        }
-
-        // 如果没有合适的视频，返回 null 并记录状态
-        log('未找到合适的视频');
-        return null;
+        return getBestVideo();
     };
 
     /**
@@ -611,17 +687,13 @@
     const handleKeyboardEvents = (enable) => {
         if (enable && !keyboardEventsRegistered) {
             // 将事件监听器绑定到 document 对象，使用 capture 模式，确保优先级更高
-            document.addEventListener('keydown', onRightKeyDown, { capture: true });
-            document.addEventListener('keydown', onLeftKeyDown, { capture: true });
-            document.addEventListener('keyup', onRightKeyUp, { capture: true });
-            document.addEventListener('keyup', onLeftKeyUp, { capture: true });
+            document.addEventListener('keydown', onKeyDown, { capture: true });
+            document.addEventListener('keyup', onKeyUp, { capture: true });
             keyboardEventsRegistered = true;
             log('键盘事件已注册');
         } else if (!enable && keyboardEventsRegistered) {
-            document.removeEventListener('keydown', onRightKeyDown, { capture: true });
-            document.removeEventListener('keydown', onLeftKeyDown, { capture: true });
-            document.removeEventListener('keyup', onRightKeyUp, { capture: true });
-            document.removeEventListener('keyup', onLeftKeyUp, { capture: true });
+            document.removeEventListener('keydown', onKeyDown, { capture: true });
+            document.removeEventListener('keyup', onKeyUp, { capture: true });
             keyboardEventsRegistered = false;
             log('键盘事件已注销');
         }
@@ -729,6 +801,22 @@
         state.leftKeyDownCount = 0;
     };
 
+    const onKeyDown = (e) => {
+        if (e.code === 'ArrowRight') {
+            onRightKeyDown(e);
+        } else if (e.code === 'ArrowLeft') {
+            onLeftKeyDown(e);
+        }
+    };
+
+    const onKeyUp = (e) => {
+        if (e.code === 'ArrowRight') {
+            onRightKeyUp(e);
+        } else if (e.code === 'ArrowLeft') {
+            onLeftKeyUp(e);
+        }
+    };
+
     // -------------------- Initialization --------------------
 
     /**
@@ -768,34 +856,9 @@
                 });
             }
 
-            // Cache existing videos and set up listeners
+            // Cache current videos, then observe future document and open Shadow DOM changes.
+            startVideoRootObserver();
             cacheAllVideos();
-
-            // Observe DOM mutations to handle dynamically added or removed videos
-            const observedVideoRoots = new WeakSet();
-            const observer = new MutationObserver((mutations) => {
-                mutations.forEach((mutation) => {
-                    const addedNodes = Array.from(mutation.addedNodes);
-                    addedNodes.forEach(node => {
-                        observeVideoRootsDeep(node, observer, observedVideoRoots);
-                        const addedVideos = findVideosRecursively(node); // 查找新增节点中的 video
-                        if (addedVideos.length > 0) {
-                            initVideoListeners(addedVideos); // 初始化新增视频
-                            log('添加新视频:', addedVideos);
-                        }
-                    });
-
-                    const removedNodes = Array.from(mutation.removedNodes);
-                    removedNodes.forEach(node => {
-                        const removedVideos = findVideosRecursively(node); // 查找移除节点中的 video
-                        if (removedVideos.length > 0) {
-                            removeFromCache(removedVideos); // 移除缓存中的视频
-                        }
-                    });
-                });
-            });
-
-            observeVideoRootsDeep(document.documentElement || document.body, observer, observedVideoRoots);
             log('MutationObserver 已启动');
 
             // 配置进度条的焦点行为
