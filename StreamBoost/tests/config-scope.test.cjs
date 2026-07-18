@@ -15,7 +15,7 @@ function exposeUserscriptTestHooks(source) {
   assert.match(source, closingPattern);
   return source.replace(
     closingPattern,
-    '\n  globalThis.__STREAMBOOST_TEST_HOOKS__ = Object.freeze({ loadSettings, readLegacyRuntimeOverrides, updateRuntimeConfig });\n})();\n'
+    '\n  globalThis.__STREAMBOOST_TEST_HOOKS__ = Object.freeze({ loadSettings, updateRuntimeConfig });\n})();\n'
   );
 }
 
@@ -280,7 +280,7 @@ test('origins A and B share GM runtime while conflicting or hostile localStorage
   assert.equal(localB.stats.reads, 0);
 });
 
-test('explicit legacy import is allowlisted and the configuration save path updates global runtime only', () => {
+test('the configuration save path updates global runtime only and never reads page storage', () => {
   const gmStore = createSharedGmStore({
     schemaVersion: 1,
     globalEnabled: true,
@@ -292,10 +292,7 @@ test('explicit legacy import is allowlisted and the configuration save path upda
   });
   const localStorageMock = createLocalStorage({
     HLS_BIGBUF_ENABLE: '0',
-    HLS_BIGBUF_DEBUG: '0',
-    HLS_BIGBUF_BLOCKLIST: '["*.example"]',
-    HLS_BIGBUF_CONC_GLOBAL: '14',
-    HLS_BIGBUF_PREFETCH: '0'
+    HLS_BIGBUF_CONC_GLOBAL: '14'
   });
   const controller = runUserscript({
     href: 'https://a.example/watch',
@@ -306,15 +303,13 @@ test('explicit legacy import is allowlisted and the configuration save path upda
 
   assert.equal(localStorageMock.stats.reads, 0);
   const hooks = controller.context.__STREAMBOOST_TEST_HOOKS__;
-  const legacy = cloneJson(hooks.readLegacyRuntimeOverrides());
-  assert.deepEqual(legacy, {
+  const current = cloneJson(hooks.loadSettings());
+  hooks.updateRuntimeConfig({
+    ...current.runtime,
     maxConcurrentPrefetches: 14,
     prefetchEnabled: false
   });
-  assert.equal(localStorageMock.stats.reads, 12);
-
-  const current = cloneJson(hooks.loadSettings());
-  hooks.updateRuntimeConfig({ ...current.runtime, ...legacy });
+  assert.equal(localStorageMock.stats.reads, 0);
 
   const saved = gmStore.values.get(SETTINGS_STORAGE_KEY);
   assert.equal(saved.globalEnabled, true);

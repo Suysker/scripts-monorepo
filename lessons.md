@@ -11,3 +11,8 @@
 - Validation rule: scope-sensitive persistence needs a multi-origin test, not only a syntax check or same-page refresh. Execute the real userscript with independent fake page stores and a shared fake GM store, then verify cross-origin settings, iframe payload snapshots, global and per-host policy, failure paths, and that page storage cannot override normal runtime.
 
 Captured while correcting StreamBoost's configuration scope in July 2026. See `.agent/execplans/streamboost-global-settings.md` and `StreamBoost/tests/config-scope.test.cjs`.
+
+## CLI authentication checks in restricted environments
+
+- Root-cause pattern: `gh auth status` was run inside a network-restricted sandbox and reported a valid keyring token as invalid, leading to an unnecessary request for the user to authenticate again.
+- Preventive rule: when authentication status requires contacting a remote service, treat a sandbox failure as inconclusive. Re-run the same read-only status check with approved network access before diagnosing expired credentials or asking the user to log in again. Keep GitHub Desktop and GitHub CLI credential stores conceptually separate, but verify each with its own client instead of inferring one from the other.
