@@ -3,33 +3,27 @@
 // @namespace    streamboost
 // @icon         https://image.suysker.xyz/i/2023/10/09/artworks-QOnSW1HR08BDMoe9-GJTeew-t500x500.webp
 // @namespace    http://tampermonkey.net/
-// @version      1.1.3
+// @version      1.2.0
 // @description  通用流媒体加速：加大缓冲、并发预取、内存命中、在途合并、按站点启停、修复部分站点自定义 Loader 导致的串行；当前覆盖 HLS.js，后续可扩展至其它播放器/协议。
 // @match        *://*/*
 // @run-at       document-start
 // @grant        GM_registerMenuCommand
 // @grant        GM_addElement
+// @grant        GM_getValue
+// @grant        GM_setValue
 // @homepage     https://github.com/Suysker/scripts-monorepo/tree/main/StreamBoost
 // @supportURL   https://github.com/Suysker/scripts-monorepo/issues
 // ==/UserScript==
 (() => {
   'use strict';
-  const LS_MASTER_KEY               = 'HLS_BIGBUF_ENABLE';               // "1"=全局开（默认）
-  const LS_DEBUG_KEY                = 'HLS_BIGBUF_DEBUG';                // "1"=开
-  const LS_PREFETCH_KEY             = 'HLS_BIGBUF_PREFETCH';             // "1"=开
-  const LS_CACHE_KEY                = 'HLS_BIGBUF_CACHE';                // "1"=开
-  const LS_BLOCKLIST                = 'HLS_BIGBUF_BLOCKLIST';            // JSON 数组：['example.com','*.foo.com']
-  const LS_PREFETCH_AHEAD_KEY       = 'HLS_BIGBUF_PREFETCH_AHEAD';
-  const LS_CONC_GLOBAL_KEY          = 'HLS_BIGBUF_CONC_GLOBAL';
-  const LS_CONC_PER_ORIGIN_KEY      = 'HLS_BIGBUF_CONC_PER_ORIGIN';
-  const LS_PREFETCH_TIMEOUT_MS_KEY  = 'HLS_BIGBUF_PREFETCH_TIMEOUT_MS';
-  const LS_WAIT_INFLIGHT_MS_KEY     = 'HLS_BIGBUF_WAIT_INFLIGHT_MS';
-  const LS_PREFETCH_STRATEGY_KEY    = 'HLS_BIGBUF_PREFETCH_STRATEGY';
-  const LS_VOD_BUFFER_SEC_KEY       = 'HLS_BIGBUF_VOD_BUFFER_SEC';
-  const LS_BACK_BUFFER_SEC_KEY      = 'HLS_BIGBUF_BACK_BUFFER_SEC';
-  const LS_MAX_MAX_BUFFER_SEC_KEY   = 'HLS_BIGBUF_MAX_MAX_BUFFER_SEC';
-  const LS_MAX_MEM_MB_KEY           = 'HLS_BIGBUF_MAX_MEM_MB';
-  const DEFAULT_VOD_BUFFER_SEC = (navigator.deviceMemory && navigator.deviceMemory < 4) ? 180 : 600;
+  const SETTINGS_STORAGE_KEY = 'streamboost.settings';
+  const SETTINGS_SCHEMA_VERSION = 1;
+  const DEFAULT_DEVICE_MEMORY_GB = 4;
+  const deviceMemoryGb = Number.isFinite(Number(navigator.deviceMemory))
+    ? Number(navigator.deviceMemory)
+    : DEFAULT_DEVICE_MEMORY_GB;
+  const DEFAULT_FORWARD_BUFFER_SEC = deviceMemoryGb < 4 ? 180 : 600;
+  const DEFAULT_MAX_MEM_MB = deviceMemoryGb >= 8 ? 192 : (deviceMemoryGb >= 4 ? 128 : 64);
   const PREFETCH_STRATEGIES = Object.freeze([
     { value: 'xhr-hls-fetch', label: 'xhr-hls-fetch（推荐）' },
     { value: 'hls-xhr-fetch', label: 'hls-xhr-fetch' },
@@ -38,36 +32,168 @@
     { value: 'fetch-only', label: 'fetch-only' },
     { value: 'fetch-xhr-hls', label: 'fetch-xhr-hls' }
   ]);
-  function readLS(key, fallback = '') { try { const raw = localStorage.getItem(key); return raw == null ? fallback : raw; } catch { return fallback; } }
-  function writeLS(key, value) { try { if (value == null) localStorage.removeItem(key); else localStorage.setItem(key, String(value)); } catch {} }
+  const CONFIG_FIELDS = Object.freeze([
+    { group: '预取并发', type: 'number', key: 'prefetchAhead', legacyKey: 'HLS_BIGBUF_PREFETCH_AHEAD', label: '预取前瞻片段数', def: 12, min: 0, max: 60, step: 1 },
+    { group: '预取并发', type: 'number', key: 'maxConcurrentPrefetches', legacyKey: 'HLS_BIGBUF_CONC_GLOBAL', label: '页面总预取并发上限', def: 4, min: 1, max: 16, step: 1 },
+    { group: '预取并发', type: 'number', key: 'maxConcurrentPrefetchesPerOrigin', legacyKey: 'HLS_BIGBUF_CONC_PER_ORIGIN', label: '单资源 Origin 并发上限', def: 4, min: 1, max: 16, step: 1 },
+    { group: '预取并发', type: 'number', key: 'inflightReuseWaitMs', legacyKey: 'HLS_BIGBUF_WAIT_INFLIGHT_MS', label: '在途复用等待（ms）', def: 500, min: 0, max: 10000, step: 50 },
+    { group: '缓冲与内存', type: 'number', key: 'forwardBufferSeconds', legacyKey: 'HLS_BIGBUF_VOD_BUFFER_SEC', label: 'HLS 前向目标（至少，秒）', def: DEFAULT_FORWARD_BUFFER_SEC, min: 60, max: 3600, step: 30 },
+    { group: '缓冲与内存', type: 'number', key: 'backBufferSeconds', legacyKey: 'HLS_BIGBUF_BACK_BUFFER_SEC', label: '回看目标（至少，秒）', def: 180, min: 0, max: 1800, step: 30 },
+    { group: '缓冲与内存', type: 'number', key: 'maxBufferSeconds', legacyKey: 'HLS_BIGBUF_MAX_MAX_BUFFER_SEC', label: '最大缓冲目标（至少，秒）', def: 1800, min: 120, max: 7200, step: 60 },
+    { group: '缓冲与内存', type: 'number', key: 'maxMemoryMb', legacyKey: 'HLS_BIGBUF_MAX_MEM_MB', label: 'LRU 上限 / MSE 目标（MB）', def: DEFAULT_MAX_MEM_MB, min: 16, max: 512, step: 8 },
+    { group: '请求策略+常规开关', type: 'bool', key: 'prefetchEnabled', legacyKey: 'HLS_BIGBUF_PREFETCH', label: '并发预取', def: true },
+    { group: '请求策略+常规开关', type: 'bool', key: 'memoryCacheEnabled', legacyKey: 'HLS_BIGBUF_CACHE', label: '内存命中 fLoader', def: true },
+    { group: '请求策略+常规开关', type: 'number', key: 'prefetchTimeoutMs', legacyKey: 'HLS_BIGBUF_PREFETCH_TIMEOUT_MS', label: '预取超时（ms）', def: 15000, min: 1000, max: 120000, step: 500 },
+    { group: '请求策略+常规开关', type: 'choice', key: 'prefetchStrategy', legacyKey: 'HLS_BIGBUF_PREFETCH_STRATEGY', label: '预取策略', def: 'xhr-hls-fetch', options: PREFETCH_STRATEGIES }
+  ]);
+  function isRecord(value) { return !!value && typeof value === 'object' && !Array.isArray(value); }
   function clampInt(value, min, max) { let out = Number.isFinite(value) ? Math.round(value) : 0; if (Number.isFinite(min)) out = Math.max(min, out); if (Number.isFinite(max)) out = Math.min(max, out); return out; }
-  function readBoolSetting(key, defaultOn = false) { return readLS(key, defaultOn ? '1' : '') === '1'; }
-  function writeBoolSetting(key, enabled) { writeLS(key, enabled ? '1' : ''); }
-  function readIntSetting(key, fallback, min, max) { const raw = String(readLS(key, '')).trim(); if (!raw) return fallback; const num = Number(raw); return Number.isFinite(num) ? clampInt(num, min, max) : fallback; }
-  function readStringSetting(key, fallback, allowedValues) { const raw = String(readLS(key, '')).trim(); return raw && allowedValues.includes(raw) ? raw : fallback; }
-  function normHost(host) { return String(host || '').trim().toLowerCase(); }
-  function readBlocklist() { try { const arr = JSON.parse(localStorage.getItem(LS_BLOCKLIST) || '[]'); return Array.isArray(arr) ? arr.filter(x => typeof x === 'string' && x.trim()) : []; } catch { return []; } }
-  function writeBlocklist(list) { try { localStorage.setItem(LS_BLOCKLIST, JSON.stringify(list)); } catch {} }
+  function normalizeFieldValue(value, field) {
+    if (field.type === 'bool') {
+      if (value == null) return !!field.def;
+      return value === true || value === 1 || value === '1';
+    }
+    if (field.type === 'number') {
+      if (value == null || String(value).trim() === '') return field.def;
+      const number = Number(value);
+      return Number.isFinite(number) ? clampInt(number, field.min, field.max) : field.def;
+    }
+    if (field.type === 'choice') {
+      const allowed = (field.options || []).map(option => option.value);
+      return allowed.includes(value) ? value : field.def;
+    }
+    return field.def;
+  }
+  function createDefaultRuntimeConfig() {
+    return Object.fromEntries(CONFIG_FIELDS.map(field => [field.key, field.def]));
+  }
+  function normalizeRuntimeConfig(candidate) {
+    const source = isRecord(candidate) ? candidate : {};
+    return Object.fromEntries(CONFIG_FIELDS.map(field => [field.key, normalizeFieldValue(source[field.key], field)]));
+  }
+  function normHost(host) { return String(host || '').trim().toLowerCase().replace(/\.+$/, ''); }
+  function normalizeHostPattern(pattern) {
+    const raw = String(pattern || '').trim().toLowerCase();
+    const wildcard = raw.startsWith('*.');
+    const host = normHost(wildcard ? raw.slice(2) : raw);
+    if (!host) return '';
+    if (host.includes(':')) {
+      if (wildcard) return '';
+      const bracketed = host.startsWith('[') && host.endsWith(']') ? host : `[${host}]`;
+      try {
+        const ipv6Host = new URL(`http://${bracketed}/`).hostname;
+        return ipv6Host.includes(':') ? ipv6Host.toLowerCase() : '';
+      } catch {
+        return '';
+      }
+    }
+    if (/\s/.test(host) || host.includes('/') || host.includes('[') || host.includes(']')) return '';
+    return wildcard ? `*.${host}` : host;
+  }
+  function normalizeHostPatterns(patterns) {
+    if (!Array.isArray(patterns)) return [];
+    return [...new Set(patterns.map(normalizeHostPattern).filter(Boolean))];
+  }
   function hostMatches(host, pattern) { host = normHost(host); pattern = normHost(pattern); if (!host || !pattern) return false; if (pattern.startsWith('*.')) { const suf = pattern.slice(2); return host === suf || host.endsWith('.' + suf); } return host === pattern; }
-  function isBlockedForURL(url) { try { const host = new URL(url, location.href).hostname; return !readBoolSetting(LS_MASTER_KEY, true) || readBlocklist().some(p => hostMatches(host, p)); } catch { return false; } }
-  function isBlockedForDoc(doc) { try { return isBlockedForURL(doc?.location?.href || doc?.URL || ''); } catch { return false; } }
+  function createDefaultSettings() {
+    return {
+      schemaVersion: SETTINGS_SCHEMA_VERSION,
+      globalEnabled: true,
+      debugEnabled: false,
+      disabledHostPatterns: [],
+      runtime: createDefaultRuntimeConfig()
+    };
+  }
+  function normalizeSettings(candidate) {
+    const defaults = createDefaultSettings();
+    const source = isRecord(candidate) ? candidate : {};
+    return {
+      schemaVersion: SETTINGS_SCHEMA_VERSION,
+      globalEnabled: source.globalEnabled == null ? defaults.globalEnabled : normalizeFieldValue(source.globalEnabled, { type: 'bool', def: defaults.globalEnabled }),
+      debugEnabled: source.debugEnabled == null ? defaults.debugEnabled : normalizeFieldValue(source.debugEnabled, { type: 'bool', def: defaults.debugEnabled }),
+      disabledHostPatterns: normalizeHostPatterns(source.disabledHostPatterns),
+      runtime: normalizeRuntimeConfig(source.runtime)
+    };
+  }
+  function assertSupportedSchema(candidate) {
+    const version = Number(isRecord(candidate) ? candidate.schemaVersion : 0);
+    if (Number.isFinite(version) && version > SETTINGS_SCHEMA_VERSION) {
+      throw new Error(`配置版本 ${version} 高于当前脚本支持的版本 ${SETTINGS_SCHEMA_VERSION}`);
+    }
+  }
+  function loadSettings() {
+    try {
+      const stored = GM_getValue(SETTINGS_STORAGE_KEY, null);
+      assertSupportedSchema(stored);
+      return normalizeSettings(stored);
+    } catch (error) {
+      throw new Error(`无法读取脚本全局配置：${error?.message || error}`);
+    }
+  }
+  function saveSettings(candidate) {
+    const normalized = normalizeSettings(candidate);
+    try {
+      assertSupportedSchema(GM_getValue(SETTINGS_STORAGE_KEY, null));
+      GM_setValue(SETTINGS_STORAGE_KEY, normalized);
+      return normalized;
+    } catch (error) {
+      throw new Error(`无法写入脚本全局配置：${error?.message || error}`);
+    }
+  }
+  function updateSettings(mutator) {
+    const current = loadSettings();
+    return saveSettings(mutator(current));
+  }
+  function updateRuntimeConfig(runtime) {
+    const normalizedRuntime = normalizeRuntimeConfig(runtime);
+    return updateSettings(current => ({ ...current, runtime: normalizedRuntime }));
+  }
+  function readLegacyRuntimeOverrides() {
+    const overrides = {};
+    let found = false;
+    try {
+      for (const field of CONFIG_FIELDS) {
+        const raw = localStorage.getItem(field.legacyKey);
+        if (raw == null) continue;
+        overrides[field.key] = normalizeFieldValue(raw, field);
+        found = true;
+      }
+    } catch {
+      return null;
+    }
+    return found ? overrides : null;
+  }
+  function isHostDisabled(host, settings) {
+    return settings.disabledHostPatterns.some(pattern => hostMatches(host, pattern));
+  }
+  function isBlockedForURL(url, settings, fallbackHost = '') {
+    try {
+      const host = new URL(url, location.href).hostname || normHost(fallbackHost);
+      return !settings.globalEnabled || isHostDisabled(host, settings);
+    } catch {
+      return !settings.globalEnabled;
+    }
+  }
+  function isBlockedForDoc(doc, settings, fallbackHost = '') { try { return isBlockedForURL(doc?.location?.href || doc?.URL || '', settings, fallbackHost); } catch { return !settings.globalEnabled; } }
+  function resolveRuntimeConfig(settings) {
+    return Object.freeze({ debugEnabled: settings.debugEnabled, ...settings.runtime });
+  }
+  function serializeForInlineScript(value) {
+    return JSON.stringify(value)
+      .replace(/</g, '\\u003c')
+      .replace(/\u2028/g, '\\u2028')
+      .replace(/\u2029/g, '\\u2029');
+  }
+  function loadBootSettings() {
+    try {
+      return loadSettings();
+    } catch (error) {
+      console.warn('[HLS BigBuffer] 配置读取失败，本页为安全起见不注入', error);
+      return { ...createDefaultSettings(), globalEnabled: false };
+    }
+  }
   const SB_CFG_MODAL_ID = 'hls-bigbuf-config-modal';
   const SB_CFG_STYLE_ID = 'hls-bigbuf-config-style';
-  const DEFAULT_MAX_MEM_MB = (navigator.deviceMemory >= 8) ? 192 : (navigator.deviceMemory >= 4 ? 128 : 64);
-  const CONFIG_FIELDS = [
-    { group: '预取并发', type: 'number', key: LS_PREFETCH_AHEAD_KEY, label: '预取前瞻片段数', def: 12, min: 0, max: 60, step: 1 },
-    { group: '预取并发', type: 'number', key: LS_CONC_GLOBAL_KEY, label: '全局并发上限', def: 4, min: 1, max: 16, step: 1 },
-    { group: '预取并发', type: 'number', key: LS_CONC_PER_ORIGIN_KEY, label: '单 Origin 并发上限', def: 4, min: 1, max: 16, step: 1 },
-    { group: '预取并发', type: 'number', key: LS_WAIT_INFLIGHT_MS_KEY, label: '在途复用等待（ms）', def: 500, min: 0, max: 10000, step: 50 },
-    { group: '缓冲与内存', type: 'number', key: LS_VOD_BUFFER_SEC_KEY, label: 'VOD 前向缓冲（秒）', def: DEFAULT_VOD_BUFFER_SEC, min: 60, max: 3600, step: 30 },
-    { group: '缓冲与内存', type: 'number', key: LS_BACK_BUFFER_SEC_KEY, label: '回看缓冲（秒）', def: 180, min: 0, max: 1800, step: 30 },
-    { group: '缓冲与内存', type: 'number', key: LS_MAX_MAX_BUFFER_SEC_KEY, label: '最大缓冲上限（秒）', def: 1800, min: 120, max: 7200, step: 60 },
-    { group: '缓冲与内存', type: 'number', key: LS_MAX_MEM_MB_KEY, label: 'LRU/MSE 缓冲上限（MB）', def: DEFAULT_MAX_MEM_MB, min: 16, max: 512, step: 8 },
-    { group: '请求策略+常规开关', type: 'bool', key: LS_PREFETCH_KEY, label: '并发预取', def: true },
-    { group: '请求策略+常规开关', type: 'bool', key: LS_CACHE_KEY, label: '内存命中 fLoader', def: true },
-    { group: '请求策略+常规开关', type: 'number', key: LS_PREFETCH_TIMEOUT_MS_KEY, label: '预取超时（ms）', def: 15000, min: 1000, max: 120000, step: 500 },
-    { group: '请求策略+常规开关', type: 'choice', key: LS_PREFETCH_STRATEGY_KEY, label: '预取策略', def: 'xhr-hls-fetch', options: PREFETCH_STRATEGIES }
-  ];
   function ensureConfigStyle() {
     if (document.getElementById(SB_CFG_STYLE_ID)) return;
     const style = document.createElement('style');
@@ -75,44 +201,37 @@
     style.textContent = `#${SB_CFG_MODAL_ID}{position:fixed;inset:0;z-index:2147483647;background:radial-gradient(1200px 520px at 8% -6%,rgba(255,212,229,.38),transparent 66%),radial-gradient(980px 520px at 100% 100%,rgba(233,232,236,.44),transparent 67%),rgba(245,240,243,.74);display:flex;align-items:center;justify-content:center;font:12px/1.3 "Segoe UI","PingFang SC","Microsoft YaHei",sans-serif;color:#4a4350}#${SB_CFG_MODAL_ID} .panel{width:min(1260px,96vw);max-height:min(92vh,760px);display:grid;grid-template-rows:auto auto;gap:10px;padding:14px;border-radius:20px;border:1px solid #f0d6e2;background:linear-gradient(145deg,rgba(255,255,255,.96),rgba(244,238,242,.95));box-shadow:0 16px 40px rgba(104,88,99,.22),inset 0 1px 0 rgba(255,255,255,.9)}#${SB_CFG_MODAL_ID} h2{margin:0;font-size:22px;color:#544a56}#${SB_CFG_MODAL_ID} .head{display:flex;justify-content:space-between;align-items:flex-start;gap:10px;flex-wrap:wrap}#${SB_CFG_MODAL_ID} .hint{margin:4px 0 0;color:#7b6f7c}#${SB_CFG_MODAL_ID} .layout{display:grid;grid-template-columns:1fr;gap:8px}#${SB_CFG_MODAL_ID} .sections{display:grid;grid-template-columns:repeat(3,minmax(220px,1fr));gap:8px}#${SB_CFG_MODAL_ID} .group{background:linear-gradient(150deg,rgba(255,255,255,.98),rgba(247,242,245,.96));border:1px solid #ecdde6;border-radius:12px;padding:8px}#${SB_CFG_MODAL_ID} .group h3{margin:0 0 6px;font-size:13px;color:#5f5462}#${SB_CFG_MODAL_ID} .group-grid{display:grid;grid-template-columns:1fr;gap:6px}#${SB_CFG_MODAL_ID} .field{background:#fff;border:1px solid #efe4eb;border-radius:10px;padding:7px;box-shadow:inset 0 1px 0 rgba(255,255,255,.9)}#${SB_CFG_MODAL_ID} .title{font-size:11px;color:#5f5463;margin-bottom:5px}#${SB_CFG_MODAL_ID} .num{display:grid;grid-template-columns:1fr 72px;gap:6px;align-items:center}#${SB_CFG_MODAL_ID} input[type=number]{width:100%;box-sizing:border-box;border:1px solid #dcced7;border-radius:7px;padding:5px 6px;font-size:12px;color:#4a4150;background:#fefcfd;text-align:center}#${SB_CFG_MODAL_ID} input[type=range]{width:100%;accent-color:#d88cae}#${SB_CFG_MODAL_ID} .chips{display:flex;gap:5px;flex-wrap:wrap}#${SB_CFG_MODAL_ID} .chip{border:1px solid #dcc6d2;background:#f8f3f6;color:#5f5562;border-radius:999px;padding:4px 7px;cursor:pointer;font-size:11px}#${SB_CFG_MODAL_ID} .chip.on{background:linear-gradient(135deg,#f6cde0,#f2b8d3);border-color:#df99bc;color:#4d3544}#${SB_CFG_MODAL_ID} .actions{display:flex;justify-content:flex-end;gap:8px}#${SB_CFG_MODAL_ID} .head .actions{margin-left:auto}#${SB_CFG_MODAL_ID} button{border:1px solid #dccad5;border-radius:9px;padding:7px 12px;cursor:pointer;font-weight:700;color:#5d4f60;background:#faf6f8}#${SB_CFG_MODAL_ID} button.primary{background:linear-gradient(135deg,#f7d2e3,#f2bad4);border-color:#de9dbe;color:#4f3c49}#${SB_CFG_MODAL_ID} .switch{display:flex;gap:6px;flex-wrap:wrap}#${SB_CFG_MODAL_ID} .switch-btn{border:1px solid #dcc6d2;background:#f8f3f6;color:#5f5562;border-radius:999px;padding:4px 10px;cursor:pointer;font-size:11px}#${SB_CFG_MODAL_ID} .switch-btn.on{background:linear-gradient(135deg,#f6cde0,#f2b8d3);border-color:#df99bc;color:#4d3544}`;
     (document.head || document.documentElement).appendChild(style);
   }
-  function readFieldValue(field) {
-    if (field.type === 'bool') return readBoolSetting(field.key, !!field.def);
-    if (field.type === 'number') return readIntSetting(field.key, field.def, field.min, field.max);
-    if (field.type === 'choice') return readStringSetting(field.key, field.def, (field.options || []).map(x => x.value));
-    return '';
-  }
-  function setDefaultValue(field, input) {
+  function setFieldControlValue(field, input, value) {
     if (!input) return;
+    const normalized = normalizeFieldValue(value, field);
     if (field.type === 'bool') {
-      for (const b of input.buttons) b.classList.toggle('on', b.dataset.value === (field.def ? '1' : '0'));
-    } else if (field.type === 'number') { input.range.value = String(field.def); input.num.value = String(field.def); }
-    else for (const b of input.buttons) b.classList.toggle('on', b.dataset.value === field.def);
-  }
-  function saveFieldValue(field, input) {
-    if (!input) return;
-    if (field.type === 'bool') {
-      const on = input.buttons.find(b => b.classList.contains('on'));
-      const val = String(on?.dataset?.value || '0') === '1';
-      writeBoolSetting(field.key, val);
-      return;
+      for (const button of input.buttons) button.classList.toggle('on', button.dataset.value === (normalized ? '1' : '0'));
     } else if (field.type === 'number') {
+      input.range.value = String(normalized);
+      input.num.value = String(normalized);
+    } else {
+      for (const button of input.buttons) button.classList.toggle('on', button.dataset.value === normalized);
+    }
+  }
+  function collectFieldControlValue(field, input) {
+    if (!input) throw new Error(`缺少配置控件：${field.label}`);
+    if (field.type === 'bool') {
+      const selected = input.buttons.find(button => button.classList.contains('on'));
+      return String(selected?.dataset?.value || '0') === '1';
+    }
+    if (field.type === 'number') {
       const raw = String(input.num.value || '').trim();
-      if (!raw) { writeLS(field.key, null); input.num.value = String(field.def); input.range.value = String(field.def); return; }
+      if (!raw) return field.def;
       const num = Number(raw);
       if (!Number.isFinite(num)) throw new Error(`${field.label} 必须是数字`);
-      const normalized = String(clampInt(num, field.min, field.max));
-      input.num.value = normalized;
-      input.range.value = normalized;
-      writeLS(field.key, normalized);
-      return;
+      return clampInt(num, field.min, field.max);
     }
     if (field.type === 'choice') {
-      const on = input.buttons.find(b => b.classList.contains('on'));
-      const val = String(on?.dataset?.value || '').trim();
-      const allowed = (field.options || []).map(x => x.value);
-      if (!allowed.includes(val)) throw new Error(`${field.label} 取值无效`);
-      writeLS(field.key, val);
-      return;
+      const selected = input.buttons.find(button => button.classList.contains('on'));
+      const value = String(selected?.dataset?.value || '').trim();
+      const allowed = (field.options || []).map(option => option.value);
+      if (!allowed.includes(value)) throw new Error(`${field.label} 取值无效`);
+      return value;
     }
     throw new Error('不支持的字段类型');
   }
@@ -120,9 +239,17 @@
     if (!document.body) { alert('页面尚未加载完成，请稍后重试。'); return; }
     ensureConfigStyle();
     document.getElementById(SB_CFG_MODAL_ID)?.remove();
+    let settings;
+    try {
+      settings = loadSettings();
+    } catch (error) {
+      alert(`无法打开配置：${error?.message || error}`);
+      return;
+    }
+    const legacyOverrides = readLegacyRuntimeOverrides();
     const modal = document.createElement('div');
     modal.id = SB_CFG_MODAL_ID;
-    modal.innerHTML = '<div class="panel"><div class="head"><div><h2>⚙️ StreamBoost 参数配置</h2><p class="hint">此页用于调整常用开关与进阶参数，保存后刷新页面生效。</p></div><div class="actions"><button data-act="close">关闭</button><button data-act="reset">恢复默认</button><button class="primary" data-act="save">保存配置</button></div></div><div class="layout"><div class="sections" data-zone="sections"></div></div></div>';
+    modal.innerHTML = '<div class="panel"><div class="head"><div><h2>⚙️ StreamBoost 全局参数</h2><p class="hint">作用于脚本匹配的所有网站与播放器 iframe；保存后刷新已打开页面生效。</p></div><div class="actions"><button data-act="import" hidden>导入本站旧参数</button><button data-act="close">关闭</button><button data-act="reset">恢复默认</button><button class="primary" data-act="save">保存全局配置</button></div></div><div class="layout"><div class="sections" data-zone="sections"></div></div></div>';
     const controls = new Map();
     const sectionsZone = modal.querySelector('[data-zone="sections"]');
     const groups = new Map();
@@ -183,28 +310,36 @@
         row.appendChild(chips);
         input = { buttons };
       }
-      if (field.type === 'bool') {
-        const val = readFieldValue(field) ? '1' : '0';
-        for (const b of input.buttons) b.classList.toggle('on', b.dataset.value === val);
-      } else if (field.type === 'number') {
-        const val = String(readFieldValue(field));
-        input.range.value = val;
-        input.num.value = val;
-      } else {
-        const val = String(readFieldValue(field));
-        for (const b of input.buttons) b.classList.toggle('on', b.dataset.value === val);
-      }
+      setFieldControlValue(field, input, settings.runtime[field.key]);
       groupGrid.appendChild(row);
       controls.set(field.key, input);
     }
     const close = () => modal.remove();
     modal.addEventListener('click', (e) => { if (e.target === modal) close(); });
     modal.querySelector('[data-act="close"]').addEventListener('click', close);
-    modal.querySelector('[data-act="reset"]').addEventListener('click', () => { for (const field of CONFIG_FIELDS) setDefaultValue(field, controls.get(field.key)); });
+    modal.querySelector('[data-act="reset"]').addEventListener('click', () => {
+      for (const field of CONFIG_FIELDS) setFieldControlValue(field, controls.get(field.key), field.def);
+    });
+    const importButton = modal.querySelector('[data-act="import"]');
+    if (legacyOverrides) {
+      importButton.hidden = false;
+      importButton.addEventListener('click', () => {
+        for (const field of CONFIG_FIELDS) {
+          if (Object.prototype.hasOwnProperty.call(legacyOverrides, field.key)) {
+            setFieldControlValue(field, controls.get(field.key), legacyOverrides[field.key]);
+          }
+        }
+        alert(`已从 ${location.origin} 载入旧参数到表单；确认无误后请保存全局配置。`);
+      });
+    }
     modal.querySelector('[data-act="save"]').addEventListener('click', () => {
       try {
-        for (const field of CONFIG_FIELDS) saveFieldValue(field, controls.get(field.key));
-        alert('配置已保存，刷新页面生效。');
+        const runtime = Object.fromEntries(CONFIG_FIELDS.map(field => [
+          field.key,
+          collectFieldControlValue(field, controls.get(field.key))
+        ]));
+        updateRuntimeConfig(runtime);
+        alert('全局配置已保存；请刷新已打开的播放页面。');
         close();
       } catch (e) {
         alert(`保存失败：${e?.message || e}`);
@@ -212,54 +347,69 @@
     });
     document.body.appendChild(modal);
   }
+  const bootSettings = loadBootSettings();
   if (typeof GM_registerMenuCommand === 'function' && window.top === window) {
-    const isDebug    = readBoolSetting(LS_DEBUG_KEY, false);
-    const masterOn   = readBoolSetting(LS_MASTER_KEY, true);
-    const host       = location.hostname;
-    const blocked    = isBlockedForURL(location.href);
-    GM_registerMenuCommand(masterOn ? '🔌 全局状态（当前：启用）' : '🔌 全局状态（当前：停用）', () => {
-      writeBoolSetting(LS_MASTER_KEY, !masterOn);
-      alert((!masterOn ? '已启用' : '已停用') + '全局；刷新页面生效');
+    const host = normHost(location.hostname);
+    const siteDisabled = isHostDisabled(host, bootSettings);
+    GM_registerMenuCommand(bootSettings.globalEnabled ? '🔌 全局状态（当前：启用）' : '🔌 全局状态（当前：停用）', () => {
+      try {
+        const updated = updateSettings(current => ({ ...current, globalEnabled: !current.globalEnabled }));
+        alert(`已${updated.globalEnabled ? '启用' : '停用'}全局；请刷新已打开页面`);
+      } catch (error) {
+        alert(`更新失败：${error?.message || error}`);
+      }
     });
-    GM_registerMenuCommand(blocked ? `✅ 在此站点启用（当前：停用 @ ${host})` : `⛔ 在此站点停用（当前：启用 @ ${host})`, () => {
-      const bl = readBlocklist();
-      const h  = normHost(host);
-      const idx = bl.findIndex(p => hostMatches(h, p));
-      if (blocked) {
-        if (idx >= 0) bl.splice(idx, 1);
-        writeBlocklist(bl);
-        alert(`已对本域名启用：${h}\n刷新页面生效`);
-      } else {
-        bl.push(h);
-        writeBlocklist(bl);
-        alert(`已对本域名停用：${h}\n刷新页面生效`);
+    GM_registerMenuCommand(siteDisabled ? `✅ 移除当前主机名停用规则（${host}）` : `⛔ 停用当前主机名（${host}）`, () => {
+      try {
+        const current = loadSettings();
+        const matchingRules = current.disabledHostPatterns.filter(pattern => hostMatches(host, pattern));
+        if (matchingRules.length) {
+          const broadRules = matchingRules.filter(pattern => pattern !== host);
+          if (broadRules.length && !confirm(`当前主机名由通配规则 ${broadRules.join('、')} 停用。\n移除后也会影响这些规则覆盖的其他主机名，是否继续？`)) return;
+          const confirmedRules = new Set(matchingRules);
+          const updated = updateSettings(latest => ({
+            ...latest,
+            disabledHostPatterns: latest.disabledHostPatterns.filter(pattern => !confirmedRules.has(pattern))
+          }));
+          const stillDisabled = isHostDisabled(host, updated);
+          alert(`已移除确认的当前主机名停用规则：${host}${stillDisabled ? '\n当前主机名仍被其他新规则停用' : ''}${updated.globalEnabled ? '' : '\n全局开关仍处于停用状态'}\n请刷新页面`);
+        } else {
+          let added = false;
+          updateSettings(latest => {
+            if (isHostDisabled(host, latest)) return latest;
+            added = true;
+            return { ...latest, disabledHostPatterns: [...latest.disabledHostPatterns, host] };
+          });
+          alert(added ? `已停用当前主机名：${host}\n请刷新页面` : `当前主机名已由其他规则停用：${host}\n请刷新页面`);
+        }
+      } catch (error) {
+        alert(`更新失败：${error?.message || error}`);
       }
     });
     GM_registerMenuCommand('⚙️ 打开参数配置页', openConfigPanel);
     GM_registerMenuCommand(
-      `🐞 Debug 日志（当前：${isDebug ? '启用' : '停用'}）`,
+      `🐞 Debug 日志（当前：${bootSettings.debugEnabled ? '启用' : '停用'}）`,
       () => {
-        const cur  = readBoolSetting(LS_DEBUG_KEY, false);
-        const next = !cur;
-        writeBoolSetting(LS_DEBUG_KEY, next);
-        alert(`已${next ? '启用' : '停用'} Debug 日志；刷新页面生效`);
+        try {
+          const updated = updateSettings(current => ({ ...current, debugEnabled: !current.debugEnabled }));
+          alert(`已${updated.debugEnabled ? '启用' : '停用'} Debug 日志；请刷新已打开页面`);
+        } catch (error) {
+          alert(`更新失败：${error?.message || error}`);
+        }
       }
     );
   }
+  const runtimeConfig = resolveRuntimeConfig(bootSettings);
   const PAYLOAD = `
-  (function(){
+  (function(RUNTIME_CONFIG){
     'use strict';
-    if (typeof localStorage !== 'undefined') {
-      try {
-        const DEBUG = (localStorage.getItem('HLS_BIGBUF_DEBUG') === '1');
-        if (DEBUG) console.log('[HLS BigBuffer] payload start', location.href, window === window.top ? 'top' : 'iframe');
-      } catch {}
-    }
+    const DEBUG = RUNTIME_CONFIG.debugEnabled === true;
+    const ACTIVE_MARKER = 'streamboost@1.2.0';
     try {
-      if (!window.__HLS_BIGBUF_ACTIVE__) {
-        window.__HLS_BIGBUF_ACTIVE__ = true;
-        console.info('[HLS BigBuffer] 已激活', location.href, window === window.top ? 'top' : 'iframe');
-      }
+      const firstActivation = window.__HLS_BIGBUF_ACTIVE__ !== ACTIVE_MARKER;
+      window.__HLS_BIGBUF_ACTIVE__ = ACTIVE_MARKER;
+      if (firstActivation && DEBUG) console.log('[HLS BigBuffer] payload start', location.href, window === window.top ? 'top' : 'iframe');
+      if (firstActivation) console.info('[HLS BigBuffer] 已激活', location.href, window === window.top ? 'top' : 'iframe');
     } catch {}
     const Native = (() => {
       let XHR   = window.XMLHttpRequest;
@@ -282,94 +432,22 @@
       } catch {}
       return { XHR, Fetch, AC };
     })();
-    const PREFETCH_STRATEGY_VALUES = [
-      'xhr-hls-fetch',
-      'hls-xhr-fetch',
-      'hls-only',
-      'xhr-only',
-      'fetch-only',
-      'fetch-xhr-hls'
-    ];
-    function clampInt(value, min, max) {
-      let out = Number.isFinite(value) ? Math.round(value) : 0;
-      if (typeof min === 'number') out = Math.max(min, out);
-      if (typeof max === 'number') out = Math.min(max, out);
-      return out;
-    }
-    function readBoolLS(key, defaultOn) {
-      let raw = null;
-      try { raw = localStorage.getItem(key); } catch {}
-      if (raw == null) return !!defaultOn;
-      return raw === '1';
-    }
-    function readIntLS(key, fallback, min, max) {
-      let raw = '';
-      try { raw = String(localStorage.getItem(key) ?? '').trim(); } catch {}
-      if (!raw) return fallback;
-      const num = Number(raw);
-      if (!Number.isFinite(num)) return fallback;
-      return clampInt(num, min, max);
-    }
-    function readStringLS(key, fallback, allowedValues) {
-      let raw = '';
-      try { raw = String(localStorage.getItem(key) ?? '').trim(); } catch {}
-      if (!raw) return fallback;
-      return allowedValues.includes(raw) ? raw : fallback;
-    }
-    const DEFAULT_VOD_BUFFER_SEC = (navigator.deviceMemory && navigator.deviceMemory < 4) ? 180 : 600;
-    const VOD_BUFFER_SEC     = readIntLS('HLS_BIGBUF_VOD_BUFFER_SEC', DEFAULT_VOD_BUFFER_SEC, 60, 3600);
-    const BACK_BUFFER_SEC    = readIntLS('HLS_BIGBUF_BACK_BUFFER_SEC', 180, 0, 1800);
-    const MAX_MAX_BUFFER_SEC = readIntLS('HLS_BIGBUF_MAX_MAX_BUFFER_SEC', 1800, 120, 7200);
-    const SITE_RULES = [];
-    function matchHostRule(ruleHost, host) {
-      const rh = String(ruleHost || '').toLowerCase().trim();
-      const h = String(host || '').toLowerCase().trim();
-      if (!rh || !h) return false;
-      if (rh.startsWith('*.')) {
-        const suf = rh.slice(2);
-        return h === suf || h.endsWith('.' + suf);
-      }
-      return h === rh;
-    }
-    function pickSiteRule(host) {
-      for (const r of SITE_RULES) {
-        if (r && matchHostRule(r.host, host)) return r;
-      }
-      return null;
-    }
-    const siteRule = pickSiteRule(location.hostname);
-    let ENABLE_PREFETCH = readBoolLS('HLS_BIGBUF_PREFETCH', true);
-    let ENABLE_MEMCACHE = readBoolLS('HLS_BIGBUF_CACHE', true);
-    const DEBUG         = readBoolLS('HLS_BIGBUF_DEBUG', false);
-    let PREFETCH_AHEAD           = readIntLS('HLS_BIGBUF_PREFETCH_AHEAD', 12, 0, 60);
-    let PREFETCH_CONC_GLOBAL     = readIntLS('HLS_BIGBUF_CONC_GLOBAL', 4, 1, 16);
-    let PREFETCH_CONC_PER_ORIGIN = readIntLS('HLS_BIGBUF_CONC_PER_ORIGIN', 4, 1, 16);
-    let PREFETCH_TIMEOUT_MS      = readIntLS('HLS_BIGBUF_PREFETCH_TIMEOUT_MS', 15000, 1000, 120000);
-    let WAIT_INFLIGHT_MS         = readIntLS('HLS_BIGBUF_WAIT_INFLIGHT_MS', 500, 0, 10000);
-    let PREFETCH_STRATEGY        = readStringLS('HLS_BIGBUF_PREFETCH_STRATEGY', 'xhr-hls-fetch', PREFETCH_STRATEGY_VALUES);
-    if (siteRule) {
-      if (typeof siteRule.prefetch === 'boolean') ENABLE_PREFETCH = siteRule.prefetch;
-      if (typeof siteRule.memcache === 'boolean') ENABLE_MEMCACHE = siteRule.memcache;
-      if (typeof siteRule.prefetchStrategy === 'string' && PREFETCH_STRATEGY_VALUES.includes(siteRule.prefetchStrategy)) {
-        PREFETCH_STRATEGY = siteRule.prefetchStrategy;
-      }
-      if (typeof siteRule.prefetchAhead === 'number') PREFETCH_AHEAD = clampInt(siteRule.prefetchAhead, 0, 60);
-      if (typeof siteRule.prefetchConcGlobal === 'number') PREFETCH_CONC_GLOBAL = clampInt(siteRule.prefetchConcGlobal, 1, 16);
-      if (typeof siteRule.prefetchConcPerOrigin === 'number') PREFETCH_CONC_PER_ORIGIN = clampInt(siteRule.prefetchConcPerOrigin, 1, 16);
-      if (typeof siteRule.prefetchTimeoutMs === 'number') PREFETCH_TIMEOUT_MS = clampInt(siteRule.prefetchTimeoutMs, 1000, 120000);
-      if (typeof siteRule.waitInflightMs === 'number') WAIT_INFLIGHT_MS = clampInt(siteRule.waitInflightMs, 0, 10000);
-    }
+    const ENABLE_PREFETCH = RUNTIME_CONFIG.prefetchEnabled;
+    const ENABLE_MEMCACHE = RUNTIME_CONFIG.memoryCacheEnabled;
+    const PREFETCH_AHEAD = RUNTIME_CONFIG.prefetchAhead;
+    const PREFETCH_CONC_GLOBAL = RUNTIME_CONFIG.maxConcurrentPrefetches;
+    const PREFETCH_CONC_PER_ORIGIN = RUNTIME_CONFIG.maxConcurrentPrefetchesPerOrigin;
+    const PREFETCH_TIMEOUT_MS = RUNTIME_CONFIG.prefetchTimeoutMs;
+    const WAIT_INFLIGHT_MS = RUNTIME_CONFIG.inflightReuseWaitMs;
+    const PREFETCH_STRATEGY = RUNTIME_CONFIG.prefetchStrategy;
+    const FORWARD_BUFFER_SEC = RUNTIME_CONFIG.forwardBufferSeconds;
+    const BACK_BUFFER_SEC = RUNTIME_CONFIG.backBufferSeconds;
+    const MAX_MAX_BUFFER_SEC = RUNTIME_CONFIG.maxBufferSeconds;
     const FAIL_TTL_MS      = 45000;
     const ORIGIN_BAN_MS    = 10 * 60 * 1000;
     const originFailCount  = new Map();
     const originBanUntil   = new Map();
-    const DEFAULT_MAX_MEM_MB = (()=> {
-      const dm = navigator.deviceMemory || 4;
-      if (dm >= 8) return 192;
-      if (dm >= 4) return 128;
-      return 64;
-    })();
-    const MAX_MEM_MB = readIntLS('HLS_BIGBUF_MAX_MEM_MB', DEFAULT_MAX_MEM_MB, 16, 512);
+    const MAX_MEM_MB = RUNTIME_CONFIG.maxMemoryMb;
     const MAX_MEM_BYTES = MAX_MEM_MB * 1024 * 1024;
     const MIN_MSE_BUFFER_BYTES = 60 * 1000 * 1000;
     const MSE_BUFFER_BYTES = Math.max(MIN_MSE_BUFFER_BYTES, MAX_MEM_BYTES);
@@ -381,7 +459,7 @@
     }
     function buildHlsBufferConfig(baseConfig = {}) {
       return {
-        maxBufferLength: enforceMinNumber(baseConfig.maxBufferLength, VOD_BUFFER_SEC),
+        maxBufferLength: enforceMinNumber(baseConfig.maxBufferLength, FORWARD_BUFFER_SEC),
         maxMaxBufferLength: enforceMinNumber(baseConfig.maxMaxBufferLength, MAX_MAX_BUFFER_SEC),
         maxBufferSize: enforceMinNumber(baseConfig.maxBufferSize, MSE_BUFFER_BYTES),
         startFragPrefetch: true,
@@ -451,7 +529,7 @@
       recentFailMap.delete(url);
     }
     function takeOriginSlot(origin) {
-      const cap = (origin && origin === location.origin) ? PREFETCH_CONC_GLOBAL : PREFETCH_CONC_PER_ORIGIN;
+      const cap = PREFETCH_CONC_PER_ORIGIN;
       const n = originSlots.get(origin) || 0;
       if (n >= cap) { if (DEBUG) log('slot denied', origin, n, '/', cap); return false; }
       originSlots.set(origin, n + 1);
@@ -866,7 +944,7 @@
                 if (!isLive) {
                   const c = this.config;
                   Object.assign(c, buildHlsBufferConfig(c));
-                  log('LEVEL_LOADED → ensured VOD config', {
+                  log('LEVEL_LOADED → ensured on-demand HLS buffer targets', {
                     maxBufferLength: c.maxBufferLength,
                     maxMaxBufferLength: c.maxMaxBufferLength,
                     maxBufferSize: c.maxBufferSize,
@@ -874,7 +952,7 @@
                     startFragPrefetch: c.startFragPrefetch
                   });
                 } else {
-                  log('LEVEL_LOADED (live) → keep default live sync');
+                  log('LEVEL_LOADED (live) → HLS buffer targets remain active; live-sync settings unchanged');
                 }
               });
             } catch {}
@@ -944,11 +1022,13 @@
     }
     registerAdapter({ name: 'hls', install: armSetterOnce });
     runAdapters();
-  })();
+  })(Object.freeze(${serializeForInlineScript(runtimeConfig)}));
   `;
+  const injectedDocuments = new WeakSet();
   function injectInto(doc = document) {
+    if (injectedDocuments.has(doc)) return;
     try {
-      if (isBlockedForDoc(doc)) {
+      if (isBlockedForDoc(doc, bootSettings, location.hostname)) {
         if (window.top === window) {
           try { console.log('[HLS BigBuffer] 已在该站点禁用'); } catch {}
         }
@@ -966,6 +1046,7 @@
     try {
       if (typeof GM_addElement === 'function') {
         GM_addElement(doc.documentElement, 'script', { textContent: PAYLOAD });
+        injectedDocuments.add(doc);
         return;
       }
     } catch {}
@@ -974,6 +1055,7 @@
     if (nonce) s.setAttribute('nonce', nonce);
     s.textContent = PAYLOAD;
     (doc.head || doc.documentElement).appendChild(s);
+    injectedDocuments.add(doc);
     s.remove();
   }
   injectInto(document);
@@ -981,16 +1063,40 @@
     try {
       const d = iframe.contentDocument;
       if (!d) return;
-      if (isBlockedForDoc(d)) return;
+      const protocol = new URL(d.location?.href || d.URL || '', location.href).protocol;
+      if (protocol === 'http:' || protocol === 'https:') return;
+      if (isBlockedForDoc(d, bootSettings, location.hostname)) return;
       injectInto(d);
-    } catch { /* 跨域: 该域会按 @match 自行注入 */ }
+    } catch { /* 跨域 frame: 由该文档自己的 @match 实例注入 */ }
   }
-  Array.from(document.getElementsByTagName('iframe')).forEach(tryInjectIframe);
-  new MutationObserver(muts => {
-    for (const m of muts) {
-      for (const n of m.addedNodes) if (n.tagName === 'IFRAME') {
-        n.addEventListener('load', () => tryInjectIframe(n));
-      }
+  const watchedIframes = new WeakSet();
+  function watchIframe(iframe) {
+    if (!iframe || watchedIframes.has(iframe)) return;
+    watchedIframes.add(iframe);
+    iframe.addEventListener('load', () => tryInjectIframe(iframe));
+    tryInjectIframe(iframe);
+  }
+  function watchIframesIn(node) {
+    if (!node) return;
+    if (node.tagName === 'IFRAME') watchIframe(node);
+    for (const iframe of node.querySelectorAll?.('iframe') || []) watchIframe(iframe);
+  }
+  function installIframeObserver() {
+    if (!document.documentElement) {
+      const onReady = () => {
+        if (!document.documentElement) return;
+        document.removeEventListener('readystatechange', onReady);
+        installIframeObserver();
+      };
+      document.addEventListener('readystatechange', onReady);
+      return;
     }
-  }).observe(document.documentElement, { childList: true, subtree: true });
+    Array.from(document.getElementsByTagName('iframe')).forEach(watchIframe);
+    new MutationObserver(mutations => {
+      for (const mutation of mutations) {
+        for (const node of mutation.addedNodes) watchIframesIn(node);
+      }
+    }).observe(document.documentElement, { childList: true, subtree: true });
+  }
+  installIframeObserver();
 })();
