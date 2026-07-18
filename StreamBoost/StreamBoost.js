@@ -33,18 +33,18 @@
     { value: 'fetch-xhr-hls', label: 'fetch-xhr-hls' }
   ]);
   const CONFIG_FIELDS = Object.freeze([
-    { group: '预取并发', type: 'number', key: 'prefetchAhead', legacyKey: 'HLS_BIGBUF_PREFETCH_AHEAD', label: '预取前瞻片段数', def: 12, min: 0, max: 60, step: 1 },
-    { group: '预取并发', type: 'number', key: 'maxConcurrentPrefetches', legacyKey: 'HLS_BIGBUF_CONC_GLOBAL', label: '页面总预取并发上限', def: 4, min: 1, max: 16, step: 1 },
-    { group: '预取并发', type: 'number', key: 'maxConcurrentPrefetchesPerOrigin', legacyKey: 'HLS_BIGBUF_CONC_PER_ORIGIN', label: '单资源 Origin 并发上限', def: 4, min: 1, max: 16, step: 1 },
-    { group: '预取并发', type: 'number', key: 'inflightReuseWaitMs', legacyKey: 'HLS_BIGBUF_WAIT_INFLIGHT_MS', label: '在途复用等待（ms）', def: 500, min: 0, max: 10000, step: 50 },
-    { group: '缓冲与内存', type: 'number', key: 'forwardBufferSeconds', legacyKey: 'HLS_BIGBUF_VOD_BUFFER_SEC', label: 'HLS 前向目标（至少，秒）', def: DEFAULT_FORWARD_BUFFER_SEC, min: 60, max: 3600, step: 30 },
-    { group: '缓冲与内存', type: 'number', key: 'backBufferSeconds', legacyKey: 'HLS_BIGBUF_BACK_BUFFER_SEC', label: '回看目标（至少，秒）', def: 180, min: 0, max: 1800, step: 30 },
-    { group: '缓冲与内存', type: 'number', key: 'maxBufferSeconds', legacyKey: 'HLS_BIGBUF_MAX_MAX_BUFFER_SEC', label: '最大缓冲目标（至少，秒）', def: 1800, min: 120, max: 7200, step: 60 },
-    { group: '缓冲与内存', type: 'number', key: 'maxMemoryMb', legacyKey: 'HLS_BIGBUF_MAX_MEM_MB', label: 'LRU 上限 / MSE 目标（MB）', def: DEFAULT_MAX_MEM_MB, min: 16, max: 512, step: 8 },
-    { group: '请求策略+常规开关', type: 'bool', key: 'prefetchEnabled', legacyKey: 'HLS_BIGBUF_PREFETCH', label: '并发预取', def: true },
-    { group: '请求策略+常规开关', type: 'bool', key: 'memoryCacheEnabled', legacyKey: 'HLS_BIGBUF_CACHE', label: '内存命中 fLoader', def: true },
-    { group: '请求策略+常规开关', type: 'number', key: 'prefetchTimeoutMs', legacyKey: 'HLS_BIGBUF_PREFETCH_TIMEOUT_MS', label: '预取超时（ms）', def: 15000, min: 1000, max: 120000, step: 500 },
-    { group: '请求策略+常规开关', type: 'choice', key: 'prefetchStrategy', legacyKey: 'HLS_BIGBUF_PREFETCH_STRATEGY', label: '预取策略', def: 'xhr-hls-fetch', options: PREFETCH_STRATEGIES }
+    { group: '预取并发', type: 'number', key: 'prefetchAhead', label: '预取前瞻片段数', def: 12, min: 0, max: 60, step: 1 },
+    { group: '预取并发', type: 'number', key: 'maxConcurrentPrefetches', label: '页面总预取并发上限', def: 4, min: 1, max: 16, step: 1 },
+    { group: '预取并发', type: 'number', key: 'maxConcurrentPrefetchesPerOrigin', label: '单资源 Origin 并发上限', def: 4, min: 1, max: 16, step: 1 },
+    { group: '预取并发', type: 'number', key: 'inflightReuseWaitMs', label: '在途复用等待（ms）', def: 500, min: 0, max: 10000, step: 50 },
+    { group: '缓冲与内存', type: 'number', key: 'forwardBufferSeconds', label: 'HLS 前向目标（至少，秒）', def: DEFAULT_FORWARD_BUFFER_SEC, min: 60, max: 3600, step: 30 },
+    { group: '缓冲与内存', type: 'number', key: 'backBufferSeconds', label: '回看目标（至少，秒）', def: 180, min: 0, max: 1800, step: 30 },
+    { group: '缓冲与内存', type: 'number', key: 'maxBufferSeconds', label: '最大缓冲目标（至少，秒）', def: 1800, min: 120, max: 7200, step: 60 },
+    { group: '缓冲与内存', type: 'number', key: 'maxMemoryMb', label: 'LRU 上限 / MSE 目标（MB）', def: DEFAULT_MAX_MEM_MB, min: 16, max: 512, step: 8 },
+    { group: '请求策略+常规开关', type: 'bool', key: 'prefetchEnabled', label: '并发预取', def: true },
+    { group: '请求策略+常规开关', type: 'bool', key: 'memoryCacheEnabled', label: '内存命中 fLoader', def: true },
+    { group: '请求策略+常规开关', type: 'number', key: 'prefetchTimeoutMs', label: '预取超时（ms）', def: 15000, min: 1000, max: 120000, step: 500 },
+    { group: '请求策略+常规开关', type: 'choice', key: 'prefetchStrategy', label: '预取策略', def: 'xhr-hls-fetch', options: PREFETCH_STRATEGIES }
   ]);
   function isRecord(value) { return !!value && typeof value === 'object' && !Array.isArray(value); }
   function clampInt(value, min, max) { let out = Number.isFinite(value) ? Math.round(value) : 0; if (Number.isFinite(min)) out = Math.max(min, out); if (Number.isFinite(max)) out = Math.min(max, out); return out; }
@@ -148,21 +148,6 @@
     const normalizedRuntime = normalizeRuntimeConfig(runtime);
     return updateSettings(current => ({ ...current, runtime: normalizedRuntime }));
   }
-  function readLegacyRuntimeOverrides() {
-    const overrides = {};
-    let found = false;
-    try {
-      for (const field of CONFIG_FIELDS) {
-        const raw = localStorage.getItem(field.legacyKey);
-        if (raw == null) continue;
-        overrides[field.key] = normalizeFieldValue(raw, field);
-        found = true;
-      }
-    } catch {
-      return null;
-    }
-    return found ? overrides : null;
-  }
   function isHostDisabled(host, settings) {
     return settings.disabledHostPatterns.some(pattern => hostMatches(host, pattern));
   }
@@ -246,10 +231,9 @@
       alert(`无法打开配置：${error?.message || error}`);
       return;
     }
-    const legacyOverrides = readLegacyRuntimeOverrides();
     const modal = document.createElement('div');
     modal.id = SB_CFG_MODAL_ID;
-    modal.innerHTML = '<div class="panel"><div class="head"><div><h2>⚙️ StreamBoost 全局参数</h2><p class="hint">作用于脚本匹配的所有网站与播放器 iframe；保存后刷新已打开页面生效。</p></div><div class="actions"><button data-act="import" hidden>导入本站旧参数</button><button data-act="close">关闭</button><button data-act="reset">恢复默认</button><button class="primary" data-act="save">保存全局配置</button></div></div><div class="layout"><div class="sections" data-zone="sections"></div></div></div>';
+    modal.innerHTML = '<div class="panel"><div class="head"><div><h2>⚙️ StreamBoost 全局参数</h2><p class="hint">作用于脚本匹配的所有网站与播放器 iframe；保存后刷新已打开页面生效。</p></div><div class="actions"><button data-act="close">关闭</button><button data-act="reset">恢复默认</button><button class="primary" data-act="save">保存全局配置</button></div></div><div class="layout"><div class="sections" data-zone="sections"></div></div></div>';
     const controls = new Map();
     const sectionsZone = modal.querySelector('[data-zone="sections"]');
     const groups = new Map();
@@ -320,18 +304,6 @@
     modal.querySelector('[data-act="reset"]').addEventListener('click', () => {
       for (const field of CONFIG_FIELDS) setFieldControlValue(field, controls.get(field.key), field.def);
     });
-    const importButton = modal.querySelector('[data-act="import"]');
-    if (legacyOverrides) {
-      importButton.hidden = false;
-      importButton.addEventListener('click', () => {
-        for (const field of CONFIG_FIELDS) {
-          if (Object.prototype.hasOwnProperty.call(legacyOverrides, field.key)) {
-            setFieldControlValue(field, controls.get(field.key), legacyOverrides[field.key]);
-          }
-        }
-        alert(`已从 ${location.origin} 载入旧参数到表单；确认无误后请保存全局配置。`);
-      });
-    }
     modal.querySelector('[data-act="save"]').addEventListener('click', () => {
       try {
         const runtime = Object.fromEntries(CONFIG_FIELDS.map(field => [
