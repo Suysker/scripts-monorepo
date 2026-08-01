@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         YFSP.TV Unlocker
 // @namespace    http://tampermonkey.net/
-// @version      1.7
+// @version      1.8
 // @description  Unlocks quality UI, danmu styles (color/type/font/avatar/location), and playback speed UI. Adds click-to-toggle play/pause. Uses player-container fullscreen to preserve danmu while keeping RTX VSR compatibility hints.
 // @author       YFSP Analyst
 // @match        *://*.yfsp.tv/*
@@ -26,8 +26,8 @@
     const CLICK_TOGGLE_DELAY_MS = 250;
     const MIN_CLICK_TOGGLE_VIDEO_EDGE_PX = 120;
     const FULLSCREEN_CONTROL_REVEAL_MS = 2500;
-    const FULLSCREEN_TARGET_CLASS = 'yfsp-fullscreen-target';
-    const FULLSCREEN_CONTROL_VISIBLE_CLASS = 'yfsp-controls-visible';
+    const FULLSCREEN_TARGET_ATTRIBUTE = 'data-yfsp-fullscreen-target';
+    const FULLSCREEN_CONTROL_VISIBLE_ATTRIBUTE = 'data-yfsp-controls-visible';
     const PLAYER_CONTAINER_SELECTOR = 'aa-videoplayer, vg-player#main-player, .video-container';
 
     const MATCH_USER = [/\/api\/payment\/getPaymentInfo/i, /\/api\/user\/info/i];
@@ -56,8 +56,8 @@ vg-quality-selector .vip-label {
     pointer-events: auto !important;
 }
 
-.${FULLSCREEN_TARGET_CLASS}:fullscreen,
-.${FULLSCREEN_TARGET_CLASS}:-webkit-full-screen {
+[${FULLSCREEN_TARGET_ATTRIBUTE}]:fullscreen,
+[${FULLSCREEN_TARGET_ATTRIBUTE}]:-webkit-full-screen {
     display: block !important;
     width: 100vw !important;
     height: 100vh !important;
@@ -73,13 +73,13 @@ vg-quality-selector .vip-label {
     inset: 0 !important;
 }
 
-.${FULLSCREEN_TARGET_CLASS}:fullscreen::backdrop,
-.${FULLSCREEN_TARGET_CLASS}:-webkit-full-screen::backdrop {
+[${FULLSCREEN_TARGET_ATTRIBUTE}]:fullscreen::backdrop,
+[${FULLSCREEN_TARGET_ATTRIBUTE}]:-webkit-full-screen::backdrop {
     background: #000 !important;
 }
 
-.${FULLSCREEN_TARGET_CLASS}:fullscreen :is(vg-player, .video-container, .video-box),
-.${FULLSCREEN_TARGET_CLASS}:-webkit-full-screen :is(vg-player, .video-container, .video-box) {
+[${FULLSCREEN_TARGET_ATTRIBUTE}]:fullscreen :is(vg-player, .video-container, .video-box),
+[${FULLSCREEN_TARGET_ATTRIBUTE}]:-webkit-full-screen :is(vg-player, .video-container, .video-box) {
     display: block !important;
     width: 100% !important;
     height: 100% !important;
@@ -93,8 +93,8 @@ vg-quality-selector .vip-label {
     overflow: hidden !important;
 }
 
-.${FULLSCREEN_TARGET_CLASS}:fullscreen video,
-.${FULLSCREEN_TARGET_CLASS}:-webkit-full-screen video {
+[${FULLSCREEN_TARGET_ATTRIBUTE}]:fullscreen video,
+[${FULLSCREEN_TARGET_ATTRIBUTE}]:-webkit-full-screen video {
     width: 100% !important;
     height: 100% !important;
     max-width: none !important;
@@ -105,8 +105,8 @@ vg-quality-selector .vip-label {
     opacity: 1 !important;
 }
 
-.${FULLSCREEN_TARGET_CLASS}.${FULLSCREEN_CONTROL_VISIBLE_CLASS}:fullscreen :is(vg-controls, vg-scrub-bar, vg-quality-selector),
-.${FULLSCREEN_TARGET_CLASS}.${FULLSCREEN_CONTROL_VISIBLE_CLASS}:-webkit-full-screen :is(vg-controls, vg-scrub-bar, vg-quality-selector) {
+[${FULLSCREEN_CONTROL_VISIBLE_ATTRIBUTE}]:fullscreen :is(vg-controls, vg-scrub-bar, vg-quality-selector),
+[${FULLSCREEN_CONTROL_VISIBLE_ATTRIBUTE}]:-webkit-full-screen :is(vg-controls, vg-scrub-bar, vg-quality-selector) {
     visibility: visible !important;
     opacity: 1 !important;
     z-index: 2147483646 !important;
@@ -460,8 +460,8 @@ vg-quality-selector .vip-label {
         if (!video || typeof video.closest !== 'function') return null;
 
         const candidates = [
-            video.closest('aa-videoplayer'),
             video.closest('vg-player#main-player'),
+            video.closest('aa-videoplayer'),
             video.closest('.video-container'),
             video.closest(PLAYER_CONTAINER_SELECTOR),
             video.parentElement
@@ -603,7 +603,7 @@ vg-quality-selector .vip-label {
 
     const getFullscreenPlayerContainer = () => {
         const element = getFullscreenElement();
-        return element && element.classList && element.classList.contains(FULLSCREEN_TARGET_CLASS) ? element : null;
+        return element && typeof element.matches === 'function' && element.matches(PLAYER_CONTAINER_SELECTOR) ? element : null;
     };
 
     const installFullscreenControlReveal = () => {
@@ -618,10 +618,11 @@ vg-quality-selector .vip-label {
             revealTimer = null;
         };
 
-        const clearFullscreenClasses = () => {
+        const clearFullscreenMarkers = () => {
             clearRevealTimer();
-            document.querySelectorAll(`.${FULLSCREEN_TARGET_CLASS}, .${FULLSCREEN_CONTROL_VISIBLE_CLASS}`).forEach((element) => {
-                element.classList.remove(FULLSCREEN_TARGET_CLASS, FULLSCREEN_CONTROL_VISIBLE_CLASS);
+            document.querySelectorAll(`[${FULLSCREEN_TARGET_ATTRIBUTE}], [${FULLSCREEN_CONTROL_VISIBLE_ATTRIBUTE}]`).forEach((element) => {
+                element.removeAttribute(FULLSCREEN_TARGET_ATTRIBUTE);
+                element.removeAttribute(FULLSCREEN_CONTROL_VISIBLE_ATTRIBUTE);
             });
         };
 
@@ -629,10 +630,10 @@ vg-quality-selector .vip-label {
             const container = getFullscreenPlayerContainer();
             if (!container) return;
 
-            container.classList.add(FULLSCREEN_CONTROL_VISIBLE_CLASS);
+            container.setAttribute(FULLSCREEN_CONTROL_VISIBLE_ATTRIBUTE, '');
             clearRevealTimer();
             revealTimer = setTimeout(() => {
-                container.classList.remove(FULLSCREEN_CONTROL_VISIBLE_CLASS);
+                container.removeAttribute(FULLSCREEN_CONTROL_VISIBLE_ATTRIBUTE);
                 revealTimer = null;
             }, FULLSCREEN_CONTROL_REVEAL_MS);
         };
@@ -643,7 +644,7 @@ vg-quality-selector .vip-label {
                 return;
             }
 
-            clearFullscreenClasses();
+            clearFullscreenMarkers();
         };
 
         ['fullscreenchange', 'webkitfullscreenchange', 'mozfullscreenchange', 'MSFullscreenChange'].forEach((eventName) => {
@@ -651,7 +652,7 @@ vg-quality-selector .vip-label {
         });
 
         ['fullscreenerror', 'webkitfullscreenerror', 'mozfullscreenerror', 'MSFullscreenError'].forEach((eventName) => {
-            document.addEventListener(eventName, clearFullscreenClasses, true);
+            document.addEventListener(eventName, clearFullscreenMarkers, true);
         });
 
         ['pointermove', 'pointerdown', 'touchstart', 'keydown'].forEach((eventName) => {
@@ -693,10 +694,10 @@ vg-quality-selector .vip-label {
                         return;
                     }
 
-                    container.classList.add(FULLSCREEN_TARGET_CLASS);
+                    container.setAttribute(FULLSCREEN_TARGET_ATTRIBUTE, '');
                     const ok = requestFullscreenSafe(container);
                     if (!ok) {
-                        container.classList.remove(FULLSCREEN_TARGET_CLASS);
+                        container.removeAttribute(FULLSCREEN_TARGET_ATTRIBUTE);
                         return;
                     }
 

@@ -11,3 +11,12 @@
 - Validation rule: scope-sensitive persistence needs a multi-origin test, not only a syntax check or same-page refresh. Execute the real userscript with independent fake page stores and a shared fake GM store, then verify cross-origin settings, iframe payload snapshots, global and per-host policy, failure paths, and that page storage cannot override normal runtime.
 
 Captured while correcting StreamBoost's configuration scope in July 2026. See `.agent/execplans/streamboost-global-settings.md` and `StreamBoost/tests/config-scope.test.cjs`.
+
+## Player fullscreen ownership and layout state
+
+- Root-cause pattern: fullscreening an outer wrapper can preserve the visible player subtree but bypass the player's own fullscreen state. YFSP only applies its `native-fullscreen` layout to `vg-player`; fullscreening `aa-videoplayer` therefore required brittle height overrides and could leave the controls or video in the upper part of the screen.
+- Preventive rule: choose the smallest fullscreen owner that still contains the video, overlays, danmu, and controls. Prefer the component that owns the site's fullscreen state, and keep outer wrappers only as structural fallbacks.
+- State-marker rule: do not make fullscreen recovery depend on a custom class surviving on a framework-owned component. Identify the active player from `document.fullscreenElement` and its semantic selector, and use dedicated `data-*` attributes for temporary styling state when the framework rewrites the component's class set.
+- Validation rule: test more than the fullscreen root dimensions. Confirm the site's fullscreen-state class, the video and overlay rectangles, control placement at the viewport edge, aspect-ratio controls, and that the rendered media remains the original `<video>` element for driver features such as NVIDIA VSR.
+
+Captured while correcting YFSP container fullscreen behavior in August 2026. See `yfsp/yfsp-unlocker.js` and `yfsp/README.md`.
