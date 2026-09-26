@@ -3,7 +3,7 @@
 // @namespace    streamboost
 // @icon         https://image.suysker.xyz/i/2023/10/09/artworks-QOnSW1HR08BDMoe9-GJTeew-t500x500.webp
 // @namespace    http://tampermonkey.net/
-// @version      1.3.0
+// @version      1.3.1
 // @description  通用流媒体加速：加大缓冲、并发预取、内存命中、在途合并、按站点启停、修复部分站点自定义 Loader 导致的串行；当前覆盖 HLS.js，后续可扩展至其它播放器/协议。
 // @match        *://*/*
 // @run-at       document-start
@@ -380,12 +380,12 @@
   (function(RUNTIME_CONFIG){
     'use strict';
     const DEBUG = RUNTIME_CONFIG.debugEnabled === true;
-    const ACTIVE_MARKER = 'streamboost@1.3.0';
+    const ACTIVE_MARKER = 'streamboost@1.3.1';
     try {
       const firstActivation = window.__HLS_BIGBUF_ACTIVE__ !== ACTIVE_MARKER;
       window.__HLS_BIGBUF_ACTIVE__ = ACTIVE_MARKER;
-      if (firstActivation && DEBUG) console.log('[HLS BigBuffer] payload start', location.href, window === window.top ? 'top' : 'iframe');
-      if (firstActivation) console.info('[HLS BigBuffer] 已激活', location.href, window === window.top ? 'top' : 'iframe');
+      if (firstActivation && DEBUG) console.log('[HLS BigBuffer] payload start', window === window.top ? 'top' : 'iframe');
+      if (firstActivation) console.info('[HLS BigBuffer] 已激活', window === window.top ? 'top' : 'iframe');
     } catch {}
     const Native = (() => {
       let XHR   = window.XMLHttpRequest;
@@ -462,14 +462,21 @@
       if (ArrayBuffer.isView(buf))    return buf.byteLength || 0;
       return 0;
     }
-    // Per-player sessions own media identity; only budgets are shared by the page.
+    // Tasks belong to players; completed bytes belong to validated resources.
     const sessions = new Set();
     const prebuf = new Map(), inflightMap = new Map(), recentFailMap = new Map(), originSlots = new Map();
-    let prebufBytes = 0, sessionSequence = 0, pumping = false;
+    const retiredByMedia = new WeakMap(), retiredScopes = new Set();
+    const RETAIN_MS = 30000, diagnosticEvents = [];
+    let prebufBytes = 0, sessionSequence = 0, resourceSequence = 0, pumping = false, pageSuspended = false;
     const metrics = { downloadedBytes: 0, usedBytes: 0, hits: 0, cancelled: 0 };
-    function deleteCache(key) {
+    function diagnose(reason, session, extra = {}) {
+      if (!DEBUG) return;
+      diagnosticEvents.push({time:performance.now(),reason,session:session?.id ?? null,...extra});
+      if (diagnosticEvents.length > 128) diagnosticEvents.shift();
+    }
+    function deleteCache(key, reason = 'replaced') {
       const entry = prebuf.get(key);
-      if (entry) { prebufBytes -= entry.bytes; prebuf.delete(key); }
+      if (entry) { prebufBytes -= entry.bytes; prebuf.delete(key); diagnose(reason,null,{bytes:entry.bytes}); }
     }
     function lruGet(key) {
       const entry = prebuf.get(key);
@@ -478,6 +485,7 @@
       prebuf.delete(key); prebuf.set(key, entry);
       if (!entry.used) { metrics.usedBytes += entry.bytes; entry.used = true; }
       metrics.hits++;
+      diagnose('cache-hit',null,{bytes:entry.bytes});
       return cloneAB(entry.buffer);
     }
     function lruSet(key, buffer, session) {
@@ -486,22 +494,140 @@
       const copy = cloneAB(buffer);
       if (!copy) return;
       deleteCache(key);
-      prebuf.set(key, { buffer: copy, bytes, session, used: false }); prebufBytes += bytes;
-      while (prebufBytes > MAX_MEM_BYTES) deleteCache(prebuf.keys().next().value);
+      const [,playlist,identity] = JSON.parse(key);
+      prebuf.set(key, { buffer: copy, bytes, scope:session.scope, playlist,identity,used: false }); prebufBytes += bytes;
+      while (prebufBytes > MAX_MEM_BYTES) deleteCache(prebuf.keys().next().value,'capacity');
     }
     function fragmentRange(context) {
       const frag = context.frag || context;
-      const start = context.rangeStart ?? frag.byteRangeStartOffset;
-      const end = context.rangeEnd ?? frag.byteRangeEndOffset;
+      // Hls.js uses 0/0 for a full response, not an empty byte range.
+      const fullResponse = context.rangeStart === 0 && context.rangeEnd === 0;
+      const start = fullResponse ? frag.byteRangeStartOffset : (context.rangeStart ?? frag.byteRangeStartOffset);
+      const end = fullResponse ? frag.byteRangeEndOffset : (context.rangeEnd ?? frag.byteRangeEndOffset);
       if (start == null && end == null) return { start: null, end: null };
       if (Number.isSafeInteger(start) && start >= 0 && Number.isSafeInteger(end) && end > start) return { start, end };
       return null;
     }
+    function completeResponse(context, data, network) {
+      const bytes = abSize(data), range = fragmentRange(context), status = network?.status;
+      if (!bytes || !range || (status && (status < 200 || status >= 300))) return false;
+      if (range.start === null) return status !== 206;
+      if (status !== 206 || bytes !== range.end - range.start) return false;
+      const contentRange = network?.getResponseHeader?.('Content-Range') || network?.headers?.get?.('Content-Range');
+      return !contentRange || contentRange.startsWith('bytes ' + range.start + '-' + (range.end - 1) + '/');
+    }
+    function fragmentIdentity(frag, url = frag?.url) {
+      if (!frag || !url || frag.encrypted) return null;
+      const range = fragmentRange(frag), init = frag.initSegment, initRange = init && fragmentRange(init);
+      if (!range || (init && (!init.url || !initRange))) return null;
+      return JSON.stringify([frag.type || 'main',url,range.start,range.end,frag.sn,frag.cc,
+        init ? [init.url,initRange.start,initRange.end] : null]);
+    }
+    function cancelTasks(session, reason) {
+      session.epoch++; session.queue = []; session.index = null;
+      for (const entry of inflightMap.values()) if (entry.session === session) entry.cancel();
+      diagnose(reason,session);
+    }
+    function invalidateScope(scope, reason) {
+      if (!scope) return;
+      clearTimeout(scope.timer); retiredScopes.delete(scope); scope.expires = 0;
+      for (const [key,entry] of prebuf) if (entry.scope === scope) deleteCache(key,reason);
+      scope.playlists.clear();
+    }
+    function requestContract(session) {
+      const c = session.hls.config;
+      return [session.Loader,c.loader,c.xhrSetup,c.fetchSetup,c.progressive];
+    }
+    function ensureScope(session) {
+      if (session.disposed || !session.hls) return null;
+      const contract = requestContract(session), source = session.source || session.hls.url;
+      if (!source) return null;
+      if (!session.scope || session.scope.source !== source || contract.some((v,i)=>v !== session.contract?.[i])) {
+        cancelTasks(session,'resource-context-changed');
+        invalidateScope(session.scope,'resource-context-changed');
+        session.catalog.clear(); session.contract = contract;
+        session.scope = {id:++resourceSequence,source,playlists:new Map(),expires:0,
+          opaque:!!(session.custom || contract[2] || contract[3] || contract[4]),loader:session.Loader};
+      }
+      const media = session.mediaRef?.deref(), previous = media && retiredByMedia.get(media);
+      if (!session.scope.opaque && !session.scope.playlists.size && previous && previous !== session.scope &&
+          previous.expires > performance.now() && previous.source === source && previous.loader === session.Loader) {
+        clearTimeout(previous.timer); retiredScopes.delete(previous); retiredByMedia.delete(media);
+        previous.expires = 0; session.scope = previous;
+        diagnose('resource-scope-restored',session);
+      }
+      return session.scope;
+    }
+    function confirmPlaylist(session, level, details) {
+      if (!ENABLE_MEMCACHE) return null;
+      const scope = ensureScope(session);
+      if (!scope || !session.mediaRef?.deref() || !details?.url || !Array.isArray(details.fragments)) return null;
+      const identities = details.fragments.map(f=>fragmentIdentity(f));
+      // Initialization segments also pass through fLoader.
+      const members = new Set(identities.filter(Boolean));
+      for (const frag of details.fragments) {
+        const init = frag.initSegment && fragmentIdentity(frag.initSegment);
+        if (init) members.add(init);
+      }
+      // Hls.js adjusts fragment start/duration after demuxing. The original
+      // manifest text and immutable resource descriptors identify a playlist.
+      const name = JSON.stringify(['main',details.url]);
+      const signature = JSON.stringify([details.m3u8 ?? null,identities]);
+      let record = scope.playlists.get(name);
+      if (!record || record.live !== !!details.live || (!details.live && record.signature !== signature)) {
+        if (record) {
+          record.active = false;
+          for (const [key,entry] of prebuf) if (entry.scope === scope && entry.playlist === record.id) deleteCache(key,'playlist-changed');
+        }
+        record = {id:++resourceSequence,live:!!details.live,signature:details.live ? null : signature,members,active:true};
+        scope.playlists.set(name,record);
+      } else {
+        record.members = members;
+        if (record.live) {
+          for (const [key,entry] of prebuf) {
+            if (entry.scope === scope && entry.playlist === record.id && !members.has(entry.identity)) deleteCache(key,'live-window-expired');
+          }
+        }
+      }
+      session.catalog.set(level,{details,record});
+      session.staleDetails?.delete(details);
+      return record;
+    }
     function resourceKey(session, context) {
-      if (context.part || context.resetIV || (context.headers && Object.keys(context.headers).length)) return null;
-      const range = fragmentRange(context);
-      if (!range || !context.url) return null;
-      return JSON.stringify([session.id, session.epoch, context.url, range.start, range.end]);
+      if (!ENABLE_MEMCACHE || pageSuspended || !ensureScope(session)) return null;
+      if (context.part || context.resetIV || (context.headers && Object.keys(context.headers).length) || session.hls.config.progressive) {
+        diagnose('unsupported-request-context',session); return null;
+      }
+      const frag = context.frag, range = fragmentRange(context);
+      if (!frag || !['main','video'].includes(frag.type || 'main') || !range || !context.url) return null;
+      const details = session.hls.levels?.[frag.level]?.details;
+      let known = session.catalog.get(frag.level);
+      if (!known || !known.record.active || known.details !== details) {
+        // Never infer resource continuity from stale levels during manifest reload.
+        if (session.manifestPending || !details || session.staleDetails?.has(details)) { diagnose('playlist-unconfirmed',session); return null; }
+        confirmPlaylist(session,frag.level,details); known = session.catalog.get(frag.level);
+      }
+      const identity = fragmentIdentity(frag,context.url), ownRange = fragmentRange(frag);
+      if (!identity || !ownRange || range.start !== ownRange.start || range.end !== ownRange.end || !known?.record.members.has(identity)) return null;
+      return JSON.stringify([session.scope.id,known.record.id,identity]);
+    }
+    function requestKey(session, key) { return JSON.stringify([session.id,key]); }
+    function disposeSession(session) {
+      if (session.disposed) return;
+      cancelTasks(session,'session-destroyed'); session.disposed = true;
+      sessions.delete(session); session.detach?.();
+      const scope = session.scope, media = (session.mediaRef || session.lastMediaRef)?.deref();
+      if (!pageSuspended && media && scope && !scope.opaque && scope.playlists.size &&
+          [...scope.playlists.values()].every(p=>!p.live) && [...prebuf.values()].some(e=>e.scope === scope)) {
+        const old = retiredByMedia.get(media);
+        if (old && old !== scope) invalidateScope(old,'retention-replaced');
+        scope.expires = performance.now() + RETAIN_MS;
+        retiredByMedia.set(media,scope); retiredScopes.add(scope);
+        scope.timer = setTimeout(()=>invalidateScope(scope,'retention-expired'),RETAIN_MS);
+      } else invalidateScope(scope,'session-destroyed');
+      session.scope = null; session.hls = null; session.mediaRef = null; session.lastMediaRef = null;
+      session.catalog.clear(); session.contract = null; session.Loader = null;
+      session.detach = null; session.schedule = null;
     }
     function sweepPenalties() {
       const now = performance.now();
@@ -510,12 +636,6 @@
       for (const map of [recentFailMap, originBanUntil, originFailCount]) {
         while (map.size > 512) map.delete(map.keys().next().value);
       }
-    }
-    function resetSession(session, dispose = false) {
-      session.epoch++; session.queue = []; session.index = null;
-      for (const entry of [...inflightMap.values()]) if (entry.session === session) entry.cancel();
-      for (const [key, entry] of prebuf) if (entry.session === session) deleteCache(key);
-      if (dispose) { session.disposed = true; sessions.delete(session); session.detach?.(); }
     }
     class CacheFirstFragLoader {
       constructor(cfg, session) {
@@ -529,15 +649,23 @@
         const generation = ++this.generation;
         this.context = context;
         this.stats.aborted = false;
-        let phase = 'waiting';
+        let phase = 'waiting', completeProgress = null;
+        const key = resourceKey(this.session, context), scope = this.session.scope;
         this.cancelLoad = () => {
           if (phase === 'done') return;
-          phase = 'done';
+          phase = 'done'; completeProgress = null;
           callbacks.onAbort?.(this.stats, context, null);
         };
         const valid = () => generation === this.generation && phase !== 'done';
         const finish = (name, args) => {
           if (!valid()) return;
+          if (name === 'onSuccess' && key && scope === this.session.scope && resourceKey(this.session,context) === key) {
+            const response = args[0]?.data;
+            const data = completeResponse(context,response,args[3]) ? response :
+              (response === completeProgress?.original && isDetached(response) ? completeProgress.copy : null);
+            if (completeResponse(context,data,args[3])) lruSet(key,data,this.session);
+          }
+          completeProgress = null;
           phase = 'done'; clearTimeout(this.waitTimer);
           if (this.inner.stats) this.stats = this.inner.stats;
           callbacks[name]?.(...args);
@@ -553,20 +681,28 @@
           callbacks.onProgress?.(this.stats, context, cloneAB(buffer), null);
           if (generation === this.generation) callbacks.onSuccess?.({url:context.url, data:buffer}, this.stats, context, null);
         };
-        const key = resourceKey(this.session, context);
         const goInner = () => {
           if (!valid() || phase !== 'waiting') return;
           phase = 'inner'; clearTimeout(this.waitTimer);
           const guarded = { ...callbacks };
           for (const name of ['onSuccess','onError','onTimeout','onAbort']) guarded[name] = (...args) => finish(name, args);
-          guarded.onProgress = (...args) => { if (valid()) callbacks.onProgress?.(...args); };
+          if (callbacks.onProgress) guarded.onProgress = (...args) => {
+            if (!valid()) return;
+            const [stats,,data,network] = args;
+            // XHR delivers the full buffer to onProgress before onSuccess. The
+            // consumer may transfer it; stage a copy, commit only on success.
+            if (key && !completeProgress && stats?.loaded === stats?.total &&
+                stats.total === abSize(data) && completeResponse(context,data,network)) completeProgress = {original:data,copy:cloneAB(data)};
+            callbacks.onProgress?.(...args);
+          };
           try { this.inner.load(context, config, guarded); this.stats = this.inner.stats || this.stats; }
           catch (error) { finish('onError', [{code:0,text:String(error)},context,null]); }
         };
         if (key) {
           const hit = lruGet(key);
           if (hit) { deliver(hit); return; }
-          const pending = inflightMap.get(key);
+          diagnose('cache-miss',this.session);
+          const pending = inflightMap.get(requestKey(this.session,key));
           if (pending) {
             this.waitTimer = setTimeout(goInner, WAIT_INFLIGHT_MS);
             pending.promise.then(buffer => {
@@ -613,10 +749,9 @@
           try { current?.abort?.(); } catch {}
         }, PREFETCH_TIMEOUT_MS);
         const range = fragmentRange(context);
-        const statusResult = (status, buffer) => {
-          if (status >= 200 && status < 300 && buffer &&
-              (range.start === null || (status === 206 && buffer.byteLength === range.end - range.start))) done({ buffer });
-          else done({ status });
+        const statusResult = (network, buffer) => {
+          if (completeResponse(context,buffer,network)) done({ buffer });
+          else done({ status:network?.status || 0 });
         };
         try {
           if (kind === 'hls') {
@@ -627,17 +762,15 @@
             handle.load(context, loaderConfig, {
               onSuccess: (response, stats, ctx, network) => {
                 const buffer = response?.data;
-                // The original loader owns range/auth semantics on this path.
-                if (buffer instanceof ArrayBuffer && (range.start === null || buffer.byteLength === range.end - range.start)) done({buffer});
-                else done({status:network?.status || 0});
+                statusResult(network || {status:response?.code},buffer);
               },
               onError: error => done({status:Number(error?.code) || 0}),
-              onTimeout: () => done({timeout:true}), onAbort: () => done({cancelled:true}), onProgress() {}
+              onTimeout: () => done({timeout:true}), onAbort: () => done({cancelled:true})
             });
           } else if (kind === 'xhr') {
             handle = new Native.XHR();
             handle.open('GET', context.url, true); handle.responseType = 'arraybuffer';
-            handle.onload = () => statusResult(handle.status, handle.response);
+            handle.onload = () => statusResult(handle, handle.response);
             handle.onerror = () => done({status:handle.status});
             handle.onabort = () => done({cancelled:true});
             handle.ontimeout = () => done({timeout:true});
@@ -651,7 +784,7 @@
             handle = new (Native.AC || AbortController)();
             const headers = range.start === null ? {} : {Range:'bytes=' + range.start + '-' + (range.end - 1)};
             (Native.Fetch || fetch)(context.url, {mode:'cors',credentials:'same-origin',headers,signal:handle.signal})
-              .then(async response => statusResult(response.status, response.ok ? await response.arrayBuffer() : null))
+              .then(async response => statusResult(response, response.ok ? await response.arrayBuffer() : null))
               .catch(() => done({status:0}));
           }
         } catch { done({status:0}); }
@@ -659,12 +792,13 @@
     }
     function startPrefetch(session, context) {
       const key = resourceKey(session, context), origin = new URL(context.url, location.href).origin;
-      if (!key || inflightMap.has(key) || prebuf.has(key)) return;
+      const pendingKey = requestKey(session,key);
+      if (!key || inflightMap.has(pendingKey) || prebuf.has(key)) return;
       const entry = { session, context, key, origin, epoch:session.epoch, cancelled:false, stopTransport:null };
       let resolve;
       entry.promise = new Promise(r => { resolve = r; });
       entry.cancel = () => { entry.cancelled = true; entry.stopTransport?.(); };
-      inflightMap.set(key, entry);
+      inflightMap.set(pendingKey, entry);
       originSlots.set(origin, (originSlots.get(origin) || 0) + 1);
       const started = performance.now();
       (async () => {
@@ -680,14 +814,14 @@
             if (response.buffer) { result = response.buffer; break; }
             if (response.cancelled || [401,403,404,429].includes(response.status)) break;
           }
-          if (!entry.cancelled && entry.epoch === session.epoch && !session.disposed) {
+          if (!entry.cancelled && entry.epoch === session.epoch && !session.disposed && resourceKey(session,context) === key) {
             if (result) {
               metrics.downloadedBytes += result.byteLength;
               lruSet(key, result, session);
               originFailCount.delete(origin); originBanUntil.delete(origin);
               session.estimate = session.estimate * 0.75 + result.byteLength * 0.25;
             } else {
-              recentFailMap.set(key, performance.now() + FAIL_TTL_MS);
+              recentFailMap.set(pendingKey, performance.now() + FAIL_TTL_MS);
               const count = (originFailCount.get(origin) || 0) + 1;
               originFailCount.set(origin, count);
               if (count >= 2) originBanUntil.set(origin, performance.now() + ORIGIN_BAN_MS);
@@ -702,7 +836,7 @@
           } else { result = null; metrics.cancelled++; }
         } catch { result = null; }
         finally {
-          if (inflightMap.get(key) === entry) inflightMap.delete(key);
+          if (inflightMap.get(pendingKey) === entry) inflightMap.delete(pendingKey);
           const slots = (originSlots.get(origin) || 1) - 1;
           if (slots) originSlots.set(origin,slots); else originSlots.delete(origin);
           resolve(result); sweepPenalties(); queueMicrotask(pumpPrefetch);
@@ -710,7 +844,7 @@
       })();
     }
     function pumpPrefetch() {
-      if (pumping) return;
+      if (pumping || pageSuspended) return;
       pumping = true;
       try {
         let progress = true;
@@ -731,7 +865,8 @@
             if (index < 0) continue;
             const context = session.queue.splice(index,1)[0], key = resourceKey(session,context);
             progress = true;
-            if (!key || prebuf.has(key) || inflightMap.has(key) || recentFailMap.get(key) > performance.now()) continue;
+            const pendingKey = requestKey(session,key);
+            if (!key || prebuf.has(key) || inflightMap.has(pendingKey) || recentFailMap.get(pendingKey) > performance.now()) continue;
             startPrefetch(session,context);
           }
         }
@@ -742,19 +877,39 @@
       const listeners = [];
       const on = (event, fn) => { if (event) { hls.on(event,fn); listeners.push([event,fn]); } };
       let media;
-      const seeking = () => resetSession(session);
+      const seeking = () => { cancelTasks(session,'seek'); session.schedule?.(); };
       const bindMedia = () => {
         media?.removeEventListener('seeking',seeking); media = hls.media;
+        if (media) session.lastMediaRef = session.mediaRef = new WeakRef(media);
+        ensureScope(session);
         media?.addEventListener('seeking',seeking);
       };
-      on(Ev.MEDIA_ATTACHED,bindMedia); bindMedia();
-      on(Ev.MEDIA_DETACHING,() => { media?.removeEventListener('seeking',seeking); media=null; resetSession(session); });
-      on(Ev.MANIFEST_LOADING,() => resetSession(session));
-      on(Ev.LEVEL_SWITCHING,() => resetSession(session));
-      on(Ev.DESTROYING,() => resetSession(session,true));
-      session.detach = () => { media?.removeEventListener('seeking',seeking); for (const [event,fn] of listeners) hls.off?.(event,fn); };
+      // The element identity is known at ATTACHING, before sourceopen. A caller
+      // may start loading in that interval, so establish ownership immediately.
+      on(Ev.MEDIA_ATTACHING,bindMedia); on(Ev.MEDIA_ATTACHED,bindMedia); bindMedia();
+      on(Ev.MEDIA_DETACHING,() => {
+        media?.removeEventListener('seeking',seeking); media=null; session.mediaRef=null;
+        cancelTasks(session,'media-detached');
+      });
+      on(Ev.MANIFEST_LOADING,(_event,data) => {
+        cancelTasks(session,'manifest-loading'); session.source = hls.url || data?.url;
+        session.staleDetails = new WeakSet([...session.catalog.values()].map(item=>item.details));
+        session.manifestPending = true; session.catalog.clear(); ensureScope(session);
+      });
+      on(Ev.MANIFEST_PARSED,() => { session.manifestPending = false; });
+      on(Ev.LEVEL_LOADED,(_event,data) => {
+        session.manifestPending = false; confirmPlaylist(session,data.level,data.details);
+      });
+      on(Ev.LEVEL_SWITCHING,() => cancelTasks(session,'level-switch'));
+      on(Ev.DESTROYING,() => disposeSession(session));
+      session.detach = () => {
+        media?.removeEventListener('seeking',seeking); media = null;
+        for (const [event,fn] of listeners) hls.off?.(event,fn);
+        listeners.length = 0;
+      };
       const schedule = (_event,data) => {
         const frag = data?.frag;
+        if (session.disposed || !media || pageSuspended) return;
         if (!frag || !['main','video'].includes(frag.type || 'main')) return;
         const details = hls.levels?.[frag.level]?.details;
         if (!Array.isArray(details?.fragments)) return;
@@ -774,7 +929,8 @@
           if (seconds >= horizon) break;
           seconds += Number(nf.duration) || 0;
           let url;
-          try { url = nf.url || new URL(nf.relurl, details.baseurl || location.href).href; } catch { continue; }
+          try { url = nf.url; } catch { continue; }
+          if (!url) continue;
           const range = fragmentRange(nf);
           if (!range) continue;
           const context = {url,responseType:'arraybuffer',type:'fragment',frag:nf,part:null};
@@ -783,10 +939,27 @@
         }
         pumpPrefetch();
       };
+      session.schedule = () => {
+        const level = hls.loadLevel >= 0 ? hls.loadLevel : hls.currentLevel;
+        const frag = hls.levels?.[level]?.details?.fragments?.find(f=>f.start <= media?.currentTime && f.start + f.duration > media.currentTime);
+        if (frag) schedule(null,{frag});
+      };
       on(Ev.FRAG_LOADING,schedule); on(Ev.FRAG_LOADED,schedule);
     }
-    window.addEventListener('pagehide', () => { for (const session of sessions) resetSession(session); });
-    if (DEBUG) window.__STREAMBOOST_DIAGNOSTICS__ = () => ({...metrics,cacheBytes:prebufBytes,activeRequests:inflightMap.size,sessions:sessions.size});
+    window.addEventListener('pagehide', () => {
+      pageSuspended = true;
+      for (const session of sessions) { cancelTasks(session,'page-hidden'); invalidateScope(session.scope,'page-hidden'); session.catalog.clear(); }
+      for (const scope of retiredScopes) invalidateScope(scope,'page-hidden');
+    });
+    window.addEventListener('pageshow', () => { pageSuspended = false; for (const session of sessions) session.schedule?.(); });
+    if (DEBUG) window.__STREAMBOOST_DIAGNOSTICS__ = () => ({...metrics,cacheBytes:prebufBytes,activeRequests:inflightMap.size,sessions:sessions.size,
+      events:diagnosticEvents.map(e=>({...e})),retainedScopes:retiredScopes.size,
+      players:[...sessions].map(s=>{
+        const media = s.hls?.media, buffered = media?.buffered;
+        return {id:s.id,taskGeneration:s.epoch,queued:s.queue.length,resource:s.scope?.id ?? null,
+          attached:!!media,currentTime:media?.currentTime ?? null,level:s.hls?.currentLevel ?? null,
+          buffered:buffered ? Array.from({length:buffered.length},(_,i)=>[buffered.start(i),buffered.end(i)]) : []};
+      })});
 
     function isCtor(v){ return typeof v === 'function' && !!v.DefaultConfig && !!v.Events; }
     const patchedConstructors = new WeakMap();
@@ -805,6 +978,7 @@
       try{
         if(!OriginalHls || OriginalHls.__HLS_BIGBUF_PATCHED__ || !isCtor(OriginalHls)) return OriginalHls;
         if (patchedConstructors.has(OriginalHls)) return patchedConstructors.get(OriginalHls);
+        const initialDefaultLoader = OriginalHls.DefaultConfig.loader;
         try {
           if (OriginalHls.DefaultConfig) Object.assign(OriginalHls.DefaultConfig, buildHlsBufferConfig(OriginalHls.DefaultConfig));
           log('DefaultConfig applied', OriginalHls.DefaultConfig);
@@ -813,8 +987,10 @@
           constructor(userConfig = {}){
             if (!userConfig || typeof userConfig !== 'object') userConfig = {};
             const enforced = Object.assign({}, userConfig, buildHlsBufferConfig(userConfig));
-            const Loader = userConfig.fLoader || userConfig.loader || OriginalHls.DefaultConfig.loader;
-            const session = {id:++sessionSequence,epoch:0,Loader,custom:!!(userConfig.fLoader || userConfig.loader),
+            const originalConfig = Object.assign({},OriginalHls.DefaultConfig,userConfig);
+            const Loader = originalConfig.fLoader || originalConfig.loader;
+            const session = {id:++sessionSequence,epoch:0,Loader,custom:!!(originalConfig.fLoader || userConfig.loader ||
+              originalConfig.loader !== initialDefaultLoader),catalog:new Map(),
               disposed:false,queue:[],index:null,estimate:2*1024*1024,limit:PREFETCH_CONC_GLOBAL,badSamples:0,goodSamples:0};
             if (ENABLE_MEMCACHE && typeof Loader === 'function') {
               enforced.fLoader = class extends CacheFirstFragLoader { constructor(cfg) { super(cfg,session); } };
@@ -845,7 +1021,7 @@
             log('Hls instance created', {prefetch:ENABLE_PREFETCH,memcache:ENABLE_MEMCACHE});
           }
           destroy() {
-            resetSession(this.__streamboostSession,true);
+            disposeSession(this.__streamboostSession);
             if (window.__HLS_BIGBUF_LAST__ === this) window.__HLS_BIGBUF_LAST__ = null;
             return super.destroy();
           }
