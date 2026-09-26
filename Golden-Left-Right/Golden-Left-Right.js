@@ -3,7 +3,7 @@
 // @description  按住"→"键倍速播放，按住"←"键减速播放，松开恢复原来的倍速，轻松追剧，看视频更灵活，还能快进/跳过大部分网站的广告！~ 支持用户单独配置倍速和秒数，并可根据根域名启用或禁用脚本
 // @icon         https://image.suysker.xyz/i/2023/10/09/artworks-QOnSW1HR08BDMoe9-GJTeew-t500x500.webp
 // @namespace    http://tampermonkey.net/
-// @version      1.1.2
+// @version      1.2.0
 // @author       Suysker
 // @match        http://*/*
 // @match        https://*/*
@@ -152,8 +152,8 @@
         const formatted = formatFieldNumber(normalized, field);
         control.range.value = formatted;
         control.num.value = formatted;
-        state[field.stateKey] = normalized;
         await saveSetting(field.key, normalized);
+        state[field.stateKey] = normalized;
     };
 
     const ensureConfigStyle = () => {
@@ -236,7 +236,7 @@
      * Retrieves the root domain of the current website.
      * @returns {string} - The root domain (e.g., example.com).
      */
-    const getRootDomain = () => {
+    const getLegacyRootDomain = () => {
         const hostname = location.hostname;
         const domainParts = hostname.split('.');
 
@@ -260,10 +260,26 @@
      * Checks if the current domain is blocked.
      * @returns {Promise<boolean>} - True if blocked, else false.
      */
+    // Explicit offline site grouping; unknown multi-label suffixes remain exact-host.
+    const getRootDomain = () => {
+        const host = location.hostname.toLowerCase().replace(/\.+$/, '');
+        if (host.includes(':') || /^\d+(?:\.\d+){3}$/.test(host) || !host.includes('.')) return host;
+        const parts = host.split('.');
+        const suffix = parts.slice(-2).join('.');
+        const grouped = new Set(['co.uk','org.uk','ac.uk','com.cn','net.cn','org.cn','gov.cn','com.au','net.au','org.au','co.jp','ne.jp','co.nz','co.kr','co.in','com.br']);
+        if (grouped.has(suffix)) return parts.slice(-3).join('.');
+        const single = new Set(['com','net','org','tv','io','app','dev','xyz','cn','de','fr','ru','info','me','online']);
+        return single.has(parts.at(-1)) ? suffix : host;
+    };
+    const readBlockedDomains = async () => {
+        const stored = await loadSetting(DOMAIN_BLOCK_LIST_KEY, []);
+        return Array.isArray(stored) ? stored.filter(x => typeof x === 'string') : [];
+    };
+
     const isDomainBlocked = async () => {
-        const blockedDomains = await loadSetting(DOMAIN_BLOCK_LIST_KEY, []);
+        const blockedDomains = await readBlockedDomains();
         const currentDomain = getRootDomain();
-        return blockedDomains.includes(currentDomain);
+        return blockedDomains.includes(currentDomain) || blockedDomains.includes(getLegacyRootDomain());
     };
 
     const isGlobalEnabled = () => readBoolSetting(GLOBAL_ENABLE_KEY, true);
@@ -272,9 +288,9 @@
      * Toggles the current domain's blocked status.
      */
     const toggleCurrentDomain = async () => {
-        const blockedDomains = await loadSetting(DOMAIN_BLOCK_LIST_KEY, []);
+        const blockedDomains = await readBlockedDomains();
         const currentDomain = getRootDomain();
-        const index = blockedDomains.indexOf(currentDomain);
+        const index = blockedDomains.findIndex(rule => rule === currentDomain || rule === getLegacyRootDomain());
         let isNowBlocked = false;
 
         if (index === -1) {
@@ -283,7 +299,9 @@
             alert(`已禁用黄金左右键脚本在此网站 (${currentDomain})`);
             isNowBlocked = true;
         } else {
-            blockedDomains.splice(index, 1);
+            for (let i = blockedDomains.length - 1; i >= 0; i--) {
+                if ([currentDomain, getLegacyRootDomain()].includes(blockedDomains[i])) blockedDomains.splice(i, 1);
+            }
             await saveSetting(DOMAIN_BLOCK_LIST_KEY, blockedDomains);
             alert(`已启用黄金左右键脚本在此网站 (${currentDomain})`);
             isNowBlocked = false;
@@ -306,32 +324,16 @@
      * Checks if any input-related element (except safe ones) is currently focused.
      * @returns {boolean} - True if an input is focused, else false.
      */
-    const isInputFocused = () => {
-        const activeElement = document.activeElement;
-        if (!activeElement) return false;
-
-        // 1. ContentEditable -> Block
-        if (activeElement.isContentEditable) return true;
-
-        const tagName = activeElement.tagName.toLowerCase();
-
-        // 2. Specific tags -> Block (Removed 'button' from blocking)
-        if (tagName === 'textarea' || tagName === 'select') return true;
-
-        // 3. Input tag handling
-        if (tagName === 'input') {
-             // Exception: range is allowed (for seeking)
-             if (activeElement.type === 'range') return false;
-             
-             // Exception: button-like inputs are allowed (don't block hotkeys)
-             const buttonTypes = ['button', 'submit', 'reset', 'image'];
-             if (buttonTypes.includes(activeElement.type)) return false;
-
-             // All other inputs (text, password, checkbox, radio, etc.) -> Block
-             return true;
-        }
-
-        return false;
+    const isInputFocused = (event) => {
+        let active = document.activeElement;
+        while (active?.shadowRoot?.activeElement) active = active.shadowRoot.activeElement;
+        return [active, ...(event?.composedPath?.() || [])].some(el => {
+            if (!el?.tagName) return false;
+            if (el.closest?.('#' + GLR_CFG_MODAL_ID) || el.isContentEditable) return true;
+            const tag = el.tagName.toLowerCase();
+            return tag === 'textarea' || tag === 'select' ||
+                (tag === 'input' && !['range','button','submit','reset','image'].includes(el.type));
+        });
     };
 
     /**
@@ -339,15 +341,18 @@
      * @param {HTMLVideoElement} video - The video element to check.
      * @returns {boolean} - True if visible, else false.
      */
+    let geometrySnapshot = null;
     const isVideoVisible = (video) => {
         if (!video || !video.isConnected) return false;
 
-        const style = window.getComputedStyle(video);
+        const cached = geometrySnapshot?.get(video);
+        const style = cached?.style || window.getComputedStyle(video);
         if (style.display === 'none' || style.visibility === 'hidden' || style.opacity === '0') {
             return false;
         }
 
-        const rect = video.getBoundingClientRect();
+        const rect = cached?.rect || video.getBoundingClientRect();
+        geometrySnapshot?.set(video, {style, rect});
         const viewportHeight = window.innerHeight || document.documentElement.clientHeight;
         const viewportWidth = window.innerWidth || document.documentElement.clientWidth;
         return (
@@ -460,7 +465,7 @@
     };
 
     const getVideoArea = (video) => {
-        const rect = video.getBoundingClientRect();
+        const rect = geometrySnapshot?.get(video)?.rect || video.getBoundingClientRect();
         return rect.width * rect.height;
     };
 
@@ -482,6 +487,11 @@
 
     const pruneDisconnectedVideos = () => {
         videoRegistry.candidates = videoRegistry.candidates.filter(video => video.isConnected);
+        for (const [video, handler] of ownedPlayListeners) if (!video.isConnected) {
+            video.removeEventListener('play', handler);
+            ownedPlayListeners.delete(video);
+            videoRegistry.initializedVideos.delete(video);
+        }
 
         if (videoRegistry.lastPlayedVideo && !videoRegistry.lastPlayedVideo.isConnected) {
             videoRegistry.lastPlayedVideo = null;
@@ -494,29 +504,42 @@
         }
     };
 
+    const ownedPlayListeners = new Map();
     const registerVideo = (video) => {
         if (!isVideoElement(video) || videoRegistry.initializedVideos.has(video)) return;
 
         videoRegistry.initializedVideos.add(video);
-        video.addEventListener('play', () => {
+        const onPlay = () => {
+            if (!videoRootObserver.running) return;
             videoRegistry.lastPlayedVideo = video;
             state.lastPlayedVideo = video; // 保持原状态字段，避免扩大状态迁移范围
             log('更新 lastPlayedVideo: 当前播放的视频', video);
-        });
+        };
+        video.addEventListener('play', onPlay);
+        ownedPlayListeners.set(video, onPlay);
     };
 
+    const shadowRoots = new Set();
+    const pendingRoots = new Set();
+    let registryTimer = null, discoveryTimer = null;
+    const scanVideoSubtree = (root, full = false) => {
+        const candidates = full ? new Set() : new Set(videoRegistry.candidates);
+        if (full) shadowRoots.clear();
+        visitElementsDeep(root, element => {
+            if (isVideoElement(element)) { registerVideo(element); candidates.add(element); }
+            if (element.shadowRoot) shadowRoots.add(element.shadowRoot);
+        });
+        videoRegistry.candidates = [...candidates].filter(video => video.isConnected);
+    };
     const refreshVideoRegistry = (root = document) => {
-        const videos = collectVideosDeep(root).filter(video => video.isConnected);
-        videos.forEach(registerVideo);
-        videoRegistry.candidates = videos;
+        scanVideoSubtree(root, root === document);
         videoRegistry.dirty = false;
         videoRegistry.scanCount++;
         pruneDisconnectedVideos();
-        log('视频注册表已刷新:', videos);
-        return videos;
+        return videoRegistry.candidates;
     };
 
-    const getBestVideo = () => {
+    const chooseBestVideo = () => {
         if (videoRegistry.dirty) {
             refreshVideoRegistry(document);
         } else {
@@ -552,57 +575,74 @@
         return null;
     };
 
+    const getBestVideo = () => {
+        geometrySnapshot = new Map();
+        try { return chooseBestVideo(); } finally { geometrySnapshot = null; }
+    };
+
     const rebuildObservedVideoRoots = () => {
         const observer = videoRootObserver.observer;
         if (!observer || !videoRootObserver.running) return;
-
         observer.disconnect();
-
-        let observedCount = 0;
-        const observeRoot = (root) => {
-            if (!isSearchableVideoRoot(root)) return;
+        observer.observe(document.documentElement || document, { childList: true, subtree: true });
+        for (const root of shadowRoots) {
+            if (!root.host.isConnected) { shadowRoots.delete(root); continue; }
             observer.observe(root, { childList: true, subtree: true });
-            observedCount++;
-        };
-
-        observeRoot(document.documentElement || document.body || document);
-        collectOpenShadowRootsDeep(document).forEach(observeRoot);
-        videoRegistry.observedRootCount = observedCount;
-        log('视频观察根已重建:', observedCount);
+        }
+        videoRegistry.observedRootCount = shadowRoots.size + 1;
     };
-
     const scheduleVideoRegistryRefresh = () => {
-        if (videoRegistry.refreshScheduled) return;
-        videoRegistry.refreshScheduled = true;
-
-        const refresh = () => {
-            videoRegistry.refreshScheduled = false;
+        if (registryTimer !== null) return;
+        registryTimer = window.setTimeout(() => {
+            registryTimer = null;
             if (!videoRootObserver.running) return;
-            refreshVideoRegistry(document);
+            for (const root of pendingRoots) if (root.isConnected) scanVideoSubtree(root);
+            pendingRoots.clear();
+            pruneDisconnectedVideos();
+            if (gesture && !gesture.video.isConnected) finishGesture();
             rebuildObservedVideoRoots();
-        };
-
-        if (typeof window.requestIdleCallback === 'function') {
-            window.requestIdleCallback(refresh, { timeout: VIDEO_REGISTRY_REFRESH_DELAY_MS });
-        } else {
-            window.setTimeout(refresh, VIDEO_REGISTRY_REFRESH_DELAY_MS);
+        }, VIDEO_REGISTRY_REFRESH_DELAY_MS);
+    };
+    const handleVideoRootMutations = mutations => {
+        let changed = false;
+        for (const mutation of mutations) {
+            for (const node of mutation.addedNodes) {
+                if (node.nodeType !== Node.ELEMENT_NODE) continue;
+                // Plain leaf text/barrage nodes cannot contain videos or shadow roots.
+                if (isVideoElement(node) || node.shadowRoot || node.childElementCount || node.tagName.includes('-')) {
+                    pendingRoots.add(node); changed = true;
+                }
+            }
+            if (mutation.removedNodes.length) changed = true;
         }
+        if (changed) scheduleVideoRegistryRefresh();
     };
-
-    const handleVideoRootMutations = (mutations) => {
-        const hasChildListChange = mutations.some(mutation => mutation.type === 'childList');
-        if (!hasChildListChange) return;
-
-        markVideoRegistryDirty('dom-mutation');
-        scheduleVideoRegistryRefresh();
-    };
-
     const startVideoRootObserver = () => {
-        if (!videoRootObserver.observer) {
-            videoRootObserver.observer = new MutationObserver(handleVideoRootMutations);
-        }
+        if (videoRootObserver.running) return;
+        videoRootObserver.observer ||= new MutationObserver(handleVideoRootMutations);
         videoRootObserver.running = true;
+        refreshVideoRegistry();
         rebuildObservedVideoRoots();
+        // Discover shadow roots attached later to existing hosts; no keyboard-path scan.
+        discoveryTimer = window.setInterval(() => {
+            if (document.hidden) return;
+            refreshVideoRegistry(); rebuildObservedVideoRoots();
+        }, 15000);
+    };
+    const stopVideoRootObserver = () => {
+        videoRootObserver.running = false;
+        videoRootObserver.observer?.disconnect();
+        clearTimeout(registryTimer); clearInterval(discoveryTimer);
+        registryTimer = discoveryTimer = null;
+        pendingRoots.clear(); shadowRoots.clear();
+        for (const [video, handler] of ownedPlayListeners) {
+            video.removeEventListener('play', handler);
+            videoRegistry.initializedVideos.delete(video);
+        }
+        ownedPlayListeners.clear();
+        videoRegistry.candidates = [];
+        videoRegistry.lastPlayedVideo = state.lastPlayedVideo = state.pageVideo = null;
+        videoRegistry.dirty = true;
     };
 
     /**
@@ -637,185 +677,89 @@
     /**
      * Sets the tabIndex of all progress bars to control focus behavior.
      */
-    function configureProgressBars() {
-        const configureProgressBar = (progressBar) => {
-            // 定义一个内部函数，为传入的元素添加 focus 事件处理
-            const disableFocus = (el) => {
-                el.addEventListener('focus', () => {
-                    if (checkPageVideo()) {
-                        el.blur();
-                    }
-                });
-            };
-
-            // 对当前进度条元素及其所有后代元素都进行配置
-            disableFocus(progressBar);
-            progressBar.querySelectorAll('*').forEach(disableFocus);
-
-            log('已配置进度条:', progressBar);
-        };
-
-        // 初始配置页面上已有的进度条
-        const progressBars = document.querySelectorAll(
-            'input[type="range"][class*="slider"], input[type="range"][class*="progress"], input[type="range"][role="slider"], .yzmplayer-controller'
-        );
-        progressBars.forEach(configureProgressBar);
-
-        // 监听 DOM 变化，处理新添加的进度条
-        const observer = new MutationObserver((mutations) => {
-            mutations.forEach((mutation) => {
-                mutation.addedNodes.forEach(node => {
-                    if (node.nodeType === Node.ELEMENT_NODE) {
-                        const nodes = node.matches('input[type="range"], .yzmplayer-controller')
-                            ? [node]
-                            : node.querySelectorAll('input[type="range"][class*="slider"], input[type="range"][class*="progress"], input[type="range"][role="slider"], .yzmplayer-controller');
-                        nodes.forEach(configureProgressBar);
-                    }
-                });
-            });
-        });
-
-        observer.observe(document.body, { childList: true, subtree: true });
-    }
-
-    // -------------------- Keyboard Event Handlers --------------------
-
-    /**
-     * Registers or unregisters keyboard event listeners.
-     * @param {boolean} enable - True to register, false to unregister.
-     */
-    const handleKeyboardEvents = (enable) => {
-        if (enable && !keyboardEventsRegistered) {
-            // 将事件监听器绑定到 document 对象，使用 capture 模式，确保优先级更高
-            document.addEventListener('keydown', onKeyDown, { capture: true });
-            document.addEventListener('keyup', onKeyUp, { capture: true });
-            keyboardEventsRegistered = true;
-            log('键盘事件已注册');
-        } else if (!enable && keyboardEventsRegistered) {
-            document.removeEventListener('keydown', onKeyDown, { capture: true });
-            document.removeEventListener('keyup', onKeyUp, { capture: true });
-            keyboardEventsRegistered = false;
-            log('键盘事件已注销');
+    // One delegated focus handler, owned by the enabled runtime.
+    const onProgressFocus = event => {
+        if (isInputFocused(event)) finishGesture();
+        const el = event.composedPath?.()[0] || event.target;
+        if (el?.closest?.('#' + GLR_CFG_MODAL_ID)) return;
+        if (el?.matches?.('input[type="range"][class*="slider"], input[type="range"][class*="progress"], input[type="range"][role="slider"]') || el?.closest?.('.yzmplayer-controller')) {
+            if (checkPageVideo()) el.blur?.();
         }
     };
-
-    /**
-     * Checks if both left and right keys are pressed.
-     * @returns {Promise<boolean>} - True if both are pressed and action is taken.
-     */
-    const checkBothKeysPressed = () => {
-        if (state.rightKeyDownCount === 1 && state.leftKeyDownCount === 1 && checkPageVideo()) {
-            state.pageVideo.currentTime += state.bothKeysJumpTime;
-            log(`同时按下左右键，快进 ${state.bothKeysJumpTime} 秒`);
-            // Reset counts to prevent repeated triggering
-            state.rightKeyDownCount = 0;
-            state.leftKeyDownCount = 0;
-            return true; // 表示已处理
-        }
-        return false;
+    let gesture = null;
+    const restoreGestureRate = () => {
+        if (!gesture?.rateChanged) return;
+        try { if (gesture.video.playbackRate === gesture.appliedRate) gesture.video.playbackRate = gesture.originalRate; } catch {}
+        gesture.rateChanged = false;
     };
-
-    /**
-     * Handles the right arrow key down event.
-     * @param {KeyboardEvent} e - The keyboard event.
-     */
-    const onRightKeyDown = (e) => {
-        if (e.code !== 'ArrowRight' || isInputFocused()) return;
-        e.preventDefault();
-        e.stopPropagation();
-        state.rightKeyDownCount++;
-
-        // 检查是否同时按下左右键
-        if (checkBothKeysPressed()) return;
-
-        if (state.rightKeyDownCount === 2 && checkPageVideo() && isVideoPlaying(state.pageVideo)) {
-            state.originalPlaybackRate = state.pageVideo.playbackRate;
-            state.pageVideo.playbackRate = state.playbackRate;
-            log('加速播放中, 倍速: ' + state.playbackRate);
-        }
+    const finishGesture = () => { restoreGestureRate(); gesture = null; };
+    const seekBy = (video, seconds) => {
+        try {
+            if (!Number.isFinite(video.currentTime)) return;
+            let target = Math.max(0, video.currentTime + seconds);
+            if (Number.isFinite(video.duration)) target = Math.min(target, video.duration);
+            else if (video.seekable?.length) {
+                const ranges = video.seekable;
+                target = Math.max(ranges.start(0), Math.min(target, ranges.end(ranges.length - 1)));
+                for (let i = 0; i < ranges.length - 1; i++) {
+                    if (target > ranges.end(i) && target < ranges.start(i + 1)) target = seconds > 0 ? ranges.start(i + 1) : ranges.end(i);
+                }
+            } else return;
+            video.currentTime = target;
+        } catch {}
     };
-
-    /**
-     * Handles the right arrow key up event.
-     * @param {KeyboardEvent} e - The keyboard event.
-     */
-    const onRightKeyUp = (e) => {
-        if (e.code !== 'ArrowRight' || isInputFocused()) return;
-        e.preventDefault();
-        e.stopPropagation();
-
-        if (state.rightKeyDownCount === 1 && checkPageVideo()) {
-            state.pageVideo.currentTime += state.changeTime;
-            log('前进 ' + state.changeTime + ' 秒');
+    const consumeKey = e => { e.preventDefault(); e.stopPropagation(); };
+    const onKeyDown = e => {
+        if (!['ArrowLeft', 'ArrowRight'].includes(e.code)) return;
+        if (e.isComposing || e.ctrlKey || e.altKey || e.metaKey || e.shiftKey || isInputFocused(e)) { finishGesture(); return; }
+        if (gesture && !gesture.video.isConnected) finishGesture();
+        if (!gesture) {
+            if (e.repeat || !checkPageVideo()) return;
+            gesture = { video: state.pageVideo, keys: new Set(), repeated: false, comboConsumed: false, rateChanged: false };
         }
-
-        // 恢复原来的倍速
-        if (state.pageVideo && state.pageVideo.playbackRate !== state.originalPlaybackRate) {
-            state.pageVideo.playbackRate = state.originalPlaybackRate;
-            log('恢复原来的倍速: ' + state.originalPlaybackRate);
-        }
-
-        state.rightKeyDownCount = 0;
-    };
-
-    /**
-     * Handles the left arrow key down event.
-     * @param {KeyboardEvent} e - The keyboard event.
-     */
-    const onLeftKeyDown = (e) => {
-        if (e.code !== 'ArrowLeft' || isInputFocused()) return;
-        e.preventDefault();
-        e.stopPropagation();
-        state.leftKeyDownCount++;
-
-        // 检查是否同时按下左右键
-        if (checkBothKeysPressed()) return;
-
-        if (state.leftKeyDownCount === 2 && checkPageVideo() && isVideoPlaying(state.pageVideo)) {
-            state.originalPlaybackRate = state.pageVideo.playbackRate;
-            state.pageVideo.playbackRate = 1 / state.playbackRate;
-            log('减速播放中, 倍速: ' + state.pageVideo.playbackRate);
+        consumeKey(e);
+        const repeated = gesture.keys.has(e.code);
+        gesture.keys.add(e.code);
+        if (gesture.comboConsumed) return;
+        if (gesture.keys.size === 2) {
+            restoreGestureRate();
+            gesture.comboConsumed = true;
+            seekBy(gesture.video, state.bothKeysJumpTime);
+        } else if (repeated) {
+            gesture.repeated = true;
+            if (!gesture.rateChanged && isVideoPlaying(gesture.video)) {
+                gesture.originalRate = gesture.video.playbackRate;
+                gesture.appliedRate = e.code === 'ArrowRight' ? state.playbackRate : 1 / state.playbackRate;
+                try { gesture.video.playbackRate = gesture.appliedRate; gesture.rateChanged = true; } catch {}
+            }
         }
     };
-
-    /**
-     * Handles the left arrow key up event.
-     * @param {KeyboardEvent} e - The keyboard event.
-     */
-    const onLeftKeyUp = (e) => {
-        if (e.code !== 'ArrowLeft' || isInputFocused()) return;
-        e.preventDefault();
-        e.stopPropagation();
-
-        if (state.leftKeyDownCount === 1 && checkPageVideo()) {
-            state.pageVideo.currentTime -= state.changeTime;
-            log('回退 ' + state.changeTime + ' 秒');
-        }
-
-        // 恢复原来的倍速
-        if (state.pageVideo && state.pageVideo.playbackRate !== state.originalPlaybackRate) {
-            state.pageVideo.playbackRate = state.originalPlaybackRate;
-            log('恢复原来的倍速: ' + state.originalPlaybackRate);
-        }
-
-        state.leftKeyDownCount = 0;
+    const onKeyUp = e => {
+        if (!gesture?.keys.has(e.code)) return;
+        consumeKey(e);
+        if (!gesture.video.isConnected || isInputFocused(e)) { finishGesture(); return; }
+        if (!gesture.comboConsumed && !gesture.repeated) seekBy(gesture.video, e.code === 'ArrowRight' ? state.changeTime : -state.changeTime);
+        restoreGestureRate();
+        gesture.keys.delete(e.code);
+        if (!gesture.keys.size) finishGesture();
+    };
+    const onVisibility = () => { if (document.hidden) finishGesture(); };
+    const onPageHide = () => handleKeyboardEvents(false);
+    const handleKeyboardEvents = enable => {
+        if (enable === keyboardEventsRegistered) return;
+        keyboardEventsRegistered = enable;
+        const method = enable ? 'addEventListener' : 'removeEventListener';
+        document[method]('keydown', onKeyDown, true);
+        document[method]('keyup', onKeyUp, true);
+        document[method]('focusin', onProgressFocus, true);
+        document[method]('visibilitychange', onVisibility);
+        window[method]('blur', finishGesture);
+        window[method]('pagehide', onPageHide);
+        if (enable) startVideoRootObserver();
+        else { finishGesture(); stopVideoRootObserver(); }
     };
 
-    const onKeyDown = (e) => {
-        if (e.code === 'ArrowRight') {
-            onRightKeyDown(e);
-        } else if (e.code === 'ArrowLeft') {
-            onLeftKeyDown(e);
-        }
-    };
 
-    const onKeyUp = (e) => {
-        if (e.code === 'ArrowRight') {
-            onRightKeyUp(e);
-        } else if (e.code === 'ArrowLeft') {
-            onLeftKeyUp(e);
-        }
-    };
 
     // -------------------- Initialization --------------------
 
@@ -856,19 +800,15 @@
                 });
             }
 
-            // Cache current videos, then observe future document and open Shadow DOM changes.
-            startVideoRootObserver();
-            cacheAllVideos();
-            log('MutationObserver 已启动');
-
-            // 配置进度条的焦点行为
-            configureProgressBars();
+            // Runtime resources are installed only while enabled.
         } catch (error) {
             console.error('初始化脚本时发生错误:', error);
         }
     };
 
     // Execute the initialization
+    window.addEventListener('pageshow', async () => {
+        try { handleKeyboardEvents(await isGlobalEnabled() && !await isDomainBlocked()); } catch {}
+    });
     init();
 })();
-

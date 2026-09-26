@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         YFSP.TV Unlocker
 // @namespace    http://tampermonkey.net/
-// @version      1.8
-// @description  Unlocks quality UI, danmu styles (color/type/font/avatar/location), and playback speed UI. Adds click-to-toggle play/pause. Uses player-container fullscreen to preserve danmu while keeping RTX VSR compatibility hints.
+// @version      1.10.0
+// @description  Uses the Windows client's playback endpoint, maps available HLS qualities, shows actual resolution and tunes VOD buffering. Adds click-to-toggle and container fullscreen.
 // @author       YFSP Analyst
 // @match        *://*.yfsp.tv/*
 // @match        *://*.yifan.tv/*
@@ -11,6 +11,9 @@
 // @match        *://*.dudupro.com/*
 // @run-at       document-start
 // @grant        unsafeWindow
+// @grant        GM_getValue
+// @grant        GM_setValue
+// @grant        GM_registerMenuCommand
 // @homepage     https://github.com/Suysker/scripts-monorepo/tree/main/yfsp
 // @supportURL   https://github.com/Suysker/scripts-monorepo/issues
 // ==/UserScript==
@@ -36,18 +39,10 @@
     const STYLE_TEXT = String.raw`
 iframe[src*="google"],
 iframe[src*="doubleclick"],
-.ad,
-.ads,
-[id*="ad_"],
-[class*="ad-"],
+:is(aa-videoplayer, .video-container) :is(.ad, .ads, [data-ad-slot]),
 .use-coin-box,
 #coin-or-upgrade-to-skip-ad,
-.dn-dialog-background,
 #dn_iframe {
-    display: none !important;
-}
-
-vg-quality-selector .vip-label {
     display: none !important;
 }
 
@@ -135,130 +130,368 @@ vg-quality-selector .vip-label {
 
     const shouldMatch = (url, patterns) => patterns.some((pattern) => pattern.test(url));
 
-    const safeToInt = (value) => {
-        if (typeof value === 'number') return value;
-        const number = parseInt(String(value), 10);
-        return Number.isFinite(number) ? number : 0;
+    const getPlaybackRequestUrl = (input, method = 'GET') => {
+        if (String(method).toUpperCase() !== 'GET' || !readPreference('yfsp.clientPlayback', true)) return input;
+        try {
+            const url = new URL(input, location.href);
+            // Windows 3.1.5: APIV3_ENDPOINT + GetHost + defaultApp.injectJSON.
+            // Route only this read-only API, not account/payment/other requests.
+            if (url.protocol !== 'https:' || url.pathname !== '/v3/video/play' ||
+                !/^m10\.(yfsp\.tv|iyf\.tv|yifan\.tv|aiyifan\.tv|dudupro\.com)$/.test(url.hostname)) return input;
+            url.hostname = 'app-m10.tripdata.app';
+            return url.href;
+        } catch (error) { return input; }
     };
 
-    const patchUserState = (user) => {
-        if (!user || typeof user !== 'object') return;
+    const hasPlayablePath = (item) => {
+        const path = item?.path;
+        const nonempty = (value) => typeof value === 'string' && value.trim().length > 0;
+        return nonempty(path) || (path && typeof path === 'object' &&
+            (nonempty(path.result) || nonempty(path.dashResult))) || false;
+    };
+    const readPreference = (key, fallback) => {
+        try {
+            const value = typeof GM_getValue === 'function' ? GM_getValue(key, fallback) : fallback;
+            return typeof value === 'boolean' ? value : fallback;
+        } catch (e) { return fallback; }
+    };
+    const CLIENT_PROFILE = Object.freeze({
+        isApp: 1,
+        package: 'com.iiff.www',
+        appVersion: '3.1.5',
+        system: 'WINDOWS',
+        deviceInfo: ''
+    });
+    const CLIENT_DEVICE_KEY = 'yfsp.clientDevice';
+    const isValidClientDevice = (value) => value && typeof value === 'object' &&
+        typeof value.uuid === 'string' && /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(value.uuid) &&
+        Number.isSafeInteger(value.start) && value.start > 0;
 
-        if (user.id == null) user.id = DEFAULT_USER_ID;
-        if (user.roleId == null || user.roleId < 0) user.roleId = DEFAULT_ROLE_ID;
-        if (user.level == null || user.level < MIN_LEVEL) user.level = MIN_LEVEL;
-        if ('isVip' in user) user.isVip = true;
-        if ('vipLevel' in user) user.vipLevel = VIP_LEVEL;
+    const installClientIdentity = () => {
+        if (!readPreference('yfsp.clientIdentity', true)) return;
+        try {
+            // Match the desktop bridge's extra_data entry point. Keep the device
+            // identity in userscript storage, never import an ID from page storage.
+            if (typeof GM_getValue !== 'function' || typeof GM_setValue !== 'function') return;
+            let device = GM_getValue(CLIENT_DEVICE_KEY, null);
+            if (!isValidClientDevice(device)) {
+                device = { uuid: crypto.randomUUID(), start: Date.now() };
+                GM_setValue(CLIENT_DEVICE_KEY, device);
+            }
+            const root = typeof unsafeWindow !== 'undefined' ? unsafeWindow : window;
+            const profile = { uuid: device.uuid, start: device.start, ...CLIENT_PROFILE };
+            // Firefox needs page-readable objects when crossing the sandbox boundary.
+            const payload = typeof cloneInto === 'function' ? cloneInto(profile, root) : profile;
+            const existing = root.extra_data;
+            if (existing && typeof existing === 'object' && !Array.isArray(existing)) {
+                Object.assign(existing, payload);
+            } else {
+                root.extra_data = payload;
+            }
+        } catch (error) {
+            console.log('[YFSP Unlocker] Client identity could not be installed:', error);
+        }
+    };
+    let playbackNotice = '';
+    let playbackNoticeUntil = 0;
+    let playbackPanel = null;
+    let bufferState = null;
+
+    const showPlaybackNotice = (message) => {
+        playbackNotice = message;
+        playbackNoticeUntil = Date.now() + 8000;
+        updatePlaybackExperience();
+    };
+
+    const getBufferedSeconds = (video) => {
+        for (let index = 0; index < video.buffered.length; index++) {
+            if (video.buffered.start(index) <= video.currentTime && video.buffered.end(index) >= video.currentTime) {
+                return Math.max(0, video.buffered.end(index) - video.currentTime);
+            }
+        }
+        return 0;
+    };
+
+    const getVideoHls = (video) => {
+        const context = video?.__ngContext__;
+        if (!Array.isArray(context)) return null;
+        const directive = context.find((entry) => entry?.hls?.media === video && entry.hls.config);
+        return directive?.hls || null;
+    };
+
+    // A quality menu entry is not itself a playable source. Match the actual
+    // manifest labels, never assume the menu order equals the HLS level order.
+    const resolveStandardQualityRoute = (item, player, hls) => {
+        if (!item) return { kind: 'delegate' };
+        if (Number(item.bitrate) > 1080) return { kind: hasPlayablePath(item) ? 'source' : 'unavailable' };
+        if (player?.isMasterEnabled && !player.hasError) {
+            if (!hls?.levels?.length) return { kind: 'pending' };
+            const matches = hls.levels.flatMap((level, index) => {
+                const label = String(level.name || level.attrs?.NAME || '').trim();
+                return /^(576|720|1080)p?$/i.test(label) && Number(label.replace(/p$/i, '')) === Number(item.bitrate) ? [index] : [];
+            });
+            if (matches.length === 1) return { kind: 'master', index: matches[0] };
+            if (hasPlayablePath(item)) return { kind: 'source' };
+            const known = hls.levels.every(level => /^(576|720|1080)p?$/i.test(String(level.name || level.attrs?.NAME || '').trim()));
+            return { kind: matches.length || !known ? 'delegate' : 'unavailable' };
+        }
+        if (hasPlayablePath(item)) return { kind: 'source' };
+        return { kind: player && !player.hasError && !hls?.levels?.length ? 'pending' : 'unavailable' };
+    };
+
+    const restoreBufferConfig = () => {
+        if (!bufferState) return;
+        const { config, original, applied } = bufferState;
+        for (const key of Object.keys(applied)) {
+            // Do not roll back a later change made by the site or StreamBoost.
+            if (config[key] === applied[key]) config[key] = original[key];
+        }
+        bufferState = null;
+    };
+
+    const tuneVodBuffer = (hls, enabled) => {
+        const details = hls?.latestLevelDetails || hls?.levels?.[hls.currentLevel]?.details;
+        const allowed = enabled && details?.live === false && !navigator.connection?.saveData;
+        if (bufferState && (bufferState.hls !== hls || !allowed)) restoreBufferConfig();
+        if (!allowed || !hls?.config) return false;
+        if (bufferState?.hls === hls) return true;
+        const config = hls.config;
+        const keys = ['maxBufferLength', 'maxMaxBufferLength', 'maxBufferSize'];
+        if (!keys.every((key) => Number.isFinite(config[key]) && config[key] >= 0)) return false;
+        const lowMemory = Number(navigator.deviceMemory) > 0 && Number(navigator.deviceMemory) < 4;
+        const target = lowMemory ? 45 : 90;
+        const original = Object.fromEntries(keys.map((key) => [key, config[key]]));
+        const applied = {
+            maxBufferLength: Math.max(config.maxBufferLength, target),
+            maxMaxBufferLength: Math.max(config.maxMaxBufferLength, config.maxBufferLength, target),
+            maxBufferSize: Math.max(config.maxBufferSize, (lowMemory ? 64 : 128) * 1024 * 1024)
+        };
+        Object.assign(config, applied);
+        bufferState = { hls, config, original, applied };
+        return true;
+    };
+
+    const updatePlaybackExperience = () => {
+        const video = findMainVideoElement();
+        const hls = getVideoHls(video);
+        const optimized = tuneVodBuffer(hls, readPreference('yfsp.bufferBoost', true));
+        const showInfo = readPreference('yfsp.showPlaybackInfo', false);
+        const notice = Date.now() < playbackNoticeUntil ? playbackNotice : '';
+        const container = video && findFullscreenContainer(video);
+        if (!container || (!showInfo && !notice)) {
+            if (playbackPanel) playbackPanel.remove();
+            playbackPanel = null;
+            return;
+        }
+        if (!playbackPanel) {
+            playbackPanel = document.createElement('div');
+            playbackPanel.setAttribute('data-yfsp-playback-info', '');
+            playbackPanel.style.cssText = 'position:absolute;top:12px;left:12px;z-index:2147483646;max-width:85%;padding:8px 12px;border-radius:6px;background:rgba(0,0,0,.78);color:#fff;font:12px/1.7 sans-serif;white-space:pre-line;pointer-events:none;text-align:left;';
+        }
+        if (playbackPanel.parentNode !== container) container.appendChild(playbackPanel);
+        const resolution = video.videoWidth && video.videoHeight ? `${video.videoWidth} × ${video.videoHeight}` : '等待视频元数据';
+        const state = video.error ? `播放错误 ${video.error.code}` : video.paused ? '已暂停' : video.readyState < 3 ? '缓冲中' : '播放中';
+        const text = [
+            showInfo ? `实际分辨率：${resolution}\n已缓冲：${getBufferedSeconds(video).toFixed(1)} 秒 · ${state}\n${optimized ? '点播缓冲优化已启用' : '使用播放器原有缓冲策略'}` : '',
+            notice
+        ].filter(Boolean).join('\n');
+        if (playbackPanel.textContent !== text) playbackPanel.textContent = text;
+    };
+
+    const installPlaybackMenus = () => {
+        if (typeof GM_registerMenuCommand !== 'function' || typeof GM_setValue !== 'function') return;
+        const toggle = (key, fallback) => {
+            const enabled = !readPreference(key, fallback);
+            GM_setValue(key, enabled);
+            showPlaybackNotice(`${key === 'yfsp.bufferBoost' ? '点播缓冲优化' : '播放状态显示'}：${enabled ? '开启' : '关闭'}`);
+        };
+        GM_registerMenuCommand('开启／关闭点播缓冲优化', () => toggle('yfsp.bufferBoost', true));
+        GM_registerMenuCommand('显示／隐藏实际画质与缓冲状态', () => toggle('yfsp.showPlaybackInfo', false));
+        GM_registerMenuCommand('开启／关闭客户端标识（刷新生效）', () => {
+            const enabled = !readPreference('yfsp.clientIdentity', true);
+            GM_setValue('yfsp.clientIdentity', enabled);
+            showPlaybackNotice(`客户端标识：${enabled ? '开启' : '关闭'}，刷新页面后生效。`);
+        });
+        GM_registerMenuCommand('开启／关闭客户端播放接口（刷新生效）', () => {
+            const enabled = !readPreference('yfsp.clientPlayback', true);
+            GM_setValue('yfsp.clientPlayback', enabled);
+            showPlaybackNotice(`客户端播放接口：${enabled ? '开启' : '关闭'}，刷新页面后生效。`);
+        });
+        GM_registerMenuCommand('开启／关闭每日自动签到', () => {
+            GM_setValue('yfsp.autoCheckIn', !readPreference('yfsp.autoCheckIn', true));
+        });
+    };
+
+    // Compatibility is local to UI components. Never mutate the account service,
+    // its observable state, HTTP credentials or the server's response objects.
+    const compatibilityUsers = new WeakMap();
+    const compatibilitySources = new WeakMap();
+    const compatibilityServices = new WeakMap();
+    const compatibilityServiceSources = new WeakMap();
+    const guestUser = Object.freeze({});
+    const patchUserState = (user) => {
+        const source = compatibilitySources.get(user) || (user && typeof user === 'object' ? user : guestUser);
+        const view = compatibilityUsers.get(source) || {};
+        Object.assign(view, source, { id: source.id || DEFAULT_USER_ID,
+            roleId: source.roleId > 0 ? source.roleId : DEFAULT_ROLE_ID,
+            level: Math.max(Number(source.level) || 0, MIN_LEVEL), isVip: true, vipLevel: VIP_LEVEL });
+        // JSON consumers retain the real identity rather than the presentation copy.
+        if (!compatibilityUsers.has(source)) Object.defineProperty(view, 'toJSON', { value: () => source });
+        compatibilityUsers.set(source, view);
+        compatibilitySources.set(view, source);
+        return view;
     };
 
     const patchServiceUser = (target) => {
         if (!target || typeof target !== 'object') return;
-        if (target._userService && target._userService.user) patchUserState(target._userService.user);
+        const service = target._userService;
+        if (!service || typeof service !== 'object') return;
+        if (!compatibilityServices.has(service)) {
+            const bound = new Map();
+            const view = new Proxy(service, { get(real, key) {
+                if (key === 'user') return patchUserState(real.user);
+                const value = Reflect.get(real, key, real);
+                if (typeof value !== 'function') return value;
+                if (!bound.has(value)) bound.set(value, value.bind(real));
+                return bound.get(value);
+            } });
+            compatibilityServices.set(service, view);
+            compatibilityServices.set(view, view);
+            compatibilityServiceSources.set(view, service);
+        }
+        target._userService = compatibilityServices.get(service);
     };
 
     const patchServiceUserState = (target) => {
-        if (!target || typeof target !== 'object') return;
-        if (target._userService && target._userService.userState && target._userService.userState._value) {
-            patchUserState(target._userService.userState._value);
+        // The shared observable is deliberately kept real; patch only its consumer.
+        patchServiceUser(target);
+    };
+
+    const patchUser = (json) => json;
+    const patchPlay = (json) => json;
+
+    const checkInMemory = new Map();
+    const checkInPending = new Set();
+    let nextCheckInScan = 0;
+    const checkInStored = (key) => {
+        try {
+            const value = (typeof GM_getValue === 'function' ? GM_getValue(key, null) : null) ?? checkInMemory.get(key);
+            if (!value || typeof value !== 'object') return undefined;
+            if (key.endsWith('.lease')) return Number.isFinite(value.until) && value.until <= Date.now() + 60000 ? value : undefined;
+            return Number.isFinite(value.nextCheck) && value.nextCheck <= Date.now() + 172800000 && typeof value.confirmed === 'boolean' ? value : undefined;
         }
+        catch { return checkInMemory.get(key); }
     };
-
-    const unlockItemFlags = (item) => {
-        if (!item || typeof item !== 'object') return;
-        item.isVIP = false;
-        item.isBought = true;
-        item.isEnabled = true;
-        if ('isNav' in item) item.isNav = true;
-        if ('isLocked' in item) item.isLocked = false;
-        if ('lock' in item) item.lock = false;
+    const saveCheckIn = (key, value) => {
+        checkInMemory.set(key, value);
+        while (checkInMemory.size > 64) checkInMemory.delete(checkInMemory.keys().next().value);
+        try { if (typeof GM_setValue === 'function') GM_setValue(key, value); } catch {}
     };
-
-    const patchUser = (json) => {
-        if (!json || !json.data) return json;
-
-        json.data.isVip = true;
-        json.data.vipLevel = VIP_LEVEL;
-        patchUserState(json.data);
-
-        if (json.data.user && typeof json.data.user === 'object') {
-            patchUserState(json.data.user);
-        }
-
-        if (Array.isArray(json.data.info)) {
-            json.data.info.forEach((info) => {
-                if (!info || typeof info !== 'object') return;
-                info.isVip = true;
-                info.vipLevel = VIP_LEVEL;
-                if ('isVip' in info || 'vipLevel' in info || 'id' in info || 'roleId' in info || 'level' in info) {
-                    patchUserState(info);
+    const signInValue = (observable) => new Promise((resolve, reject) => {
+        let settled = false, subscription;
+        const finish = (error, value) => {
+            if (settled) return;
+            settled = true;
+            clearTimeout(timer);
+            subscription?.unsubscribe?.();
+            error ? reject(error) : resolve(value);
+        };
+        const timer = setTimeout(() => finish(new Error('check-in timeout')), 12000);
+        try {
+            subscription = observable.subscribe({ next: value => finish(null, value),
+                error: error => finish(error), complete: () => finish(new Error('empty check-in response')) });
+            if (settled) subscription?.unsubscribe?.();
+        } catch (error) { finish(error); }
+    });
+    const getCheckInContext = (component) => {
+        const service = component?.signInService;
+        const users = compatibilityServiceSources.get(component?._userService) || component?._userService;
+        const user = compatibilitySources.get(users?.user) || users?.user;
+        const helper = service?.httpClientHelper;
+        if (!(Number(user?.id) > 0) || Number(helper?.token?.uid) !== Number(user.id) ||
+            typeof helper.token.token !== 'string' || !helper.token.token ||
+            typeof helper.globalHandler !== 'function' ||
+            typeof service?.getSignInData !== 'function' || typeof service?.signInSubmit !== 'function') return null;
+        return { service, users, helper, uid: Number(user.id), token: helper.token.token };
+    };
+    const runDailyCheckIn = async (component) => {
+        if (!readPreference('yfsp.autoCheckIn', true)) return;
+        const context = getCheckInContext(component);
+        if (!context) return;
+        const { service, users, helper, uid, token } = context;
+        const key = `yfsp.checkIn.${location.hostname}.${uid}`;
+        if (checkInPending.has(key) || Number(checkInStored(key)?.nextCheck) > Date.now()) return;
+        checkInPending.add(key);
+        const stillCurrent = () => {
+            const current = getCheckInContext(component);
+            return readPreference('yfsp.autoCheckIn', true) && current?.uid === uid && current.token === token;
+        };
+        const work = async () => {
+            if (!stillCurrent() || Number(checkInStored(key)?.nextCheck) > Date.now()) return;
+            saveCheckIn(key, { nextCheck: Date.now() + 30 * 60 * 1000, confirmed: false });
+            // Reuse native routes, payload and signing, but suppress dialogs only
+            // for this background receiver. Never alter the shared helper.
+            const quietHelper = new Proxy(helper, { get(target, name, receiver) {
+                if (name === 'globalHandler') return data => data?.code === 0;
+                return Reflect.get(target, name, receiver);
+            } });
+            const quietService = Object.create(service, { httpClientHelper: { value: quietHelper } });
+            const readStatus = async () => {
+                const response = await signInValue(service.getSignInData.call(quietService, uid));
+                const status = Array.isArray(response) ? response[0] : null;
+                if (!status || ![0, 1].includes(status.bonus_status)) throw new Error('unknown check-in status');
+                return status;
+            };
+            try {
+                let status = await readStatus();
+                if (!stillCurrent()) return;
+                let reward;
+                if (status.bonus_status === 0) {
+                    const response = await signInValue(service.signInSubmit.call(quietService));
+                    if (!stillCurrent()) return;
+                    reward = Array.isArray(response) ? response[0] : null;
+                    status = await readStatus();
                 }
-            });
-        }
-
-        return json;
-    };
-
-    const patchPlay = (json) => {
-        if (!json?.data?.info || !Array.isArray(json.data.info)) return json;
-
-        json.data.info.forEach((info) => {
-            if (!info || !Array.isArray(info.clarity)) return;
-
-            let best = null;
-            info.clarity.forEach((clarity) => {
-                if (!clarity || !clarity.path) return;
-                if (!best) {
-                    best = clarity;
-                    return;
+                if (!stillCurrent() || status.bonus_status !== 1) return;
+                const midnight = new Date(); midnight.setHours(24, 0, 0, 0);
+                const seconds = Number(status.sign_after);
+                const nextCheck = Number.isFinite(seconds) && seconds > 0 ?
+                    Date.now() + Math.min(seconds, 172800) * 1000 : midnight.getTime();
+                saveCheckIn(key, { nextCheck, confirmed: true });
+                service.setNewState?.(status);
+                service.afterSigned?.(true);
+                if (reward && typeof users.updateUserData === 'function') {
+                    const update = {};
+                    for (const [field, source] of Object.entries({ dnCoins: 'gold', experience: 'experience',
+                        level: 'currentLevel', expToNextLevel: 'nextLevel' })) {
+                        if (Number.isFinite(reward[source])) update[field] = reward[source];
+                    }
+                    if (Object.keys(update).length) users.updateUserData(update);
                 }
-
-                const currentScore = [safeToInt(clarity.qualityIndex), safeToInt(clarity.bitrate), safeToInt(clarity.title)];
-                const bestScore = [safeToInt(best.qualityIndex), safeToInt(best.bitrate), safeToInt(best.title)];
-
-                if (
-                    currentScore[0] > bestScore[0] ||
-                    (currentScore[0] === bestScore[0] &&
-                        (currentScore[1] > bestScore[1] ||
-                            (currentScore[1] === bestScore[1] && currentScore[2] > bestScore[2])))
-                ) {
-                    best = clarity;
-                }
-            });
-
-            info.clarity.forEach((clarity) => {
-                if (!clarity) return;
-
-                clarity.isBought = true;
-                clarity.isVIP = false;
-                clarity.isEnabled = true;
-                if (best && !clarity.path && best.path) clarity.path = best.path;
-                if (best && best.key && !clarity.key) clarity.key = best.key;
-            });
-        });
-
-        return json;
-    };
-
-    const patchBitrates = (bitrates) => {
-        if (!Array.isArray(bitrates)) return false;
-
-        let changed = false;
-        bitrates.forEach((bitrate) => {
-            if (!bitrate || typeof bitrate !== 'object') return;
-
-            if (bitrate.isVIP === true || bitrate.isBought === false || bitrate.isEnabled === false) {
-                bitrate.isVIP = false;
-                bitrate.isBought = true;
-                bitrate.isEnabled = true;
-                changed = true;
+            } catch { /* Quiet failure; no account data in logs. */ }
+        };
+        try {
+            if (navigator.locks?.request) {
+                await navigator.locks.request(key, { ifAvailable: true }, lock => lock ? work() : undefined);
+            } else {
+                // Best-effort cross-tab lease when Web Locks is unavailable.
+                const leaseKey = `${key}.lease`;
+                if (Number(checkInStored(leaseKey)?.until) > Date.now()) return;
+                const owner = crypto.randomUUID();
+                saveCheckIn(leaseKey, { owner, until: Date.now() + 60000 });
+                await new Promise(resolve => setTimeout(resolve, 150 + Math.random() * 150));
+                if (checkInStored(leaseKey)?.owner !== owner) return;
+                try { await work(); }
+                finally { if (checkInStored(leaseKey)?.owner === owner) saveCheckIn(leaseKey, { until: 0 }); }
             }
-
-            if ('isNav' in bitrate) bitrate.isNav = true;
-            if ('isLocked' in bitrate) bitrate.isLocked = false;
-            if ('lock' in bitrate) bitrate.lock = false;
-        });
-
-        return changed;
+        } catch { /* Feature failures must not interrupt playback. */ }
+        finally { checkInPending.delete(key); }
+    };
+    const autoCheckIn = () => {
+        if (Date.now() < nextCheckInScan || !readPreference('yfsp.autoCheckIn', true)) return;
+        nextCheckInScan = Date.now() + 15000;
+        const component = findAngularComponent('app-dn-menu', entry => entry?.signInService && entry?._userService);
+        if (component) void runDailyCheckIn(component);
     };
 
     const unlockList = (list) => {
@@ -274,124 +507,44 @@ vg-quality-selector .vip-label {
         });
     };
 
-    const safeJson = async (response) => {
-        try {
-            const clone = response.clone();
-            return await clone.json();
-        } catch (e) {
-            return null;
-        }
-    };
-
-    const rebuildJsonResponse = (response, payload) =>
-        new Response(JSON.stringify(payload), {
-            status: response.status,
-            statusText: response.statusText,
-            headers: response.headers
-        });
-
+    // Route requests only. Preserve the original Response/XHR body and metadata.
     const hookFetch = (root) => {
-        if (!root || root.__yfsp_fetch_hooked) return;
-
-        const originalFetch = root.fetch;
-        if (typeof originalFetch !== 'function') return;
-
-        root.fetch = async function(...args) {
-            const requestUrl = normalizeUrl(args[0]);
-
-            if (shouldMatch(requestUrl, MATCH_USER)) {
-                const response = await originalFetch.apply(this, args);
-                const json = patchUser(await safeJson(response));
-                return json ? rebuildJsonResponse(response, json) : response;
-            }
-
-            if (shouldMatch(requestUrl, MATCH_PLAY)) {
-                const response = await originalFetch.apply(this, args);
-                const json = patchPlay(await safeJson(response));
-                return json ? rebuildJsonResponse(response, json) : response;
-            }
-
-            return originalFetch.apply(this, args);
+        if (!root || root.__yfsp_fetch_hooked || typeof root.fetch !== 'function') return;
+        const original = root.fetch;
+        root.fetch = function(input, init) {
+            const url = normalizeUrl(input);
+            const routed = getPlaybackRequestUrl(url, init?.method || input?.method || 'GET');
+            if (routed !== url) input = typeof root.Request === 'function' && input instanceof root.Request ? new root.Request(routed, input) : routed;
+            return original.call(this, input, init);
         };
-
         root.__yfsp_fetch_hooked = true;
     };
-
     const hookXhr = (root) => {
-        if (!root || root.__yfsp_xhr_hooked) return;
-
-        const proto = root.XMLHttpRequest && root.XMLHttpRequest.prototype;
+        const proto = root?.XMLHttpRequest?.prototype;
         if (!proto || proto.__yfsp_patched) return;
-
-        const originalOpen = proto.open;
-        const originalSend = proto.send;
-
+        const original = proto.open;
         proto.open = function(method, url, ...rest) {
-            this.__yfsp_url = normalizeUrl(url);
-            return originalOpen.call(this, method, url, ...rest);
+            return original.call(this, method, getPlaybackRequestUrl(normalizeUrl(url), method), ...rest);
         };
-
-        proto.send = function(...sendArgs) {
-            const listener = () => {
-                if (this.readyState !== 4) return;
-                this.removeEventListener('readystatechange', listener);
-
-                const requestUrl = this.__yfsp_url || '';
-                if (!requestUrl) return;
-                if (!(shouldMatch(requestUrl, MATCH_USER) || shouldMatch(requestUrl, MATCH_PLAY))) return;
-                if (this.responseType && this.responseType !== 'text' && this.responseType !== 'json' && this.responseType !== '') return;
-
-                let json = null;
-                if (this.responseType === 'json') {
-                    if (this.response && typeof this.response === 'object') json = this.response;
-                } else {
-                    const text = this.responseText;
-                    if (!text || text[0] !== '{') return;
-                    try {
-                        json = JSON.parse(text);
-                    } catch (e) {
-                        return;
-                    }
-                }
-
-                json = shouldMatch(requestUrl, MATCH_USER) ? patchUser(json) : patchPlay(json);
-                const jsonText = JSON.stringify(json);
-
-                try {
-                    Object.defineProperty(this, 'responseText', { configurable: true, get: () => jsonText });
-                } catch (e) {}
-
-                try {
-                    Object.defineProperty(this, 'response', {
-                        configurable: true,
-                        get: () => (this.responseType === 'json' ? json : jsonText)
-                    });
-                } catch (e) {}
-            };
-
-            this.addEventListener('readystatechange', listener);
-            return originalSend.apply(this, sendArgs);
-        };
-
         proto.__yfsp_patched = true;
         root.__yfsp_xhr_hooked = true;
     };
 
     const ensureStyle = () => {
         if (document.getElementById(STYLE_ID)) return;
+        const parent = document.head || document.documentElement;
+        if (!parent) return;
 
         const style = document.createElement('style');
         style.id = STYLE_ID;
         style.append(STYLE_TEXT);
 
-        (document.head || document.documentElement).appendChild(style);
+        parent.appendChild(style);
     };
 
     const applyGlobals = (root) => {
         try {
-            Object.defineProperty(root, 'isVip', { get: () => true, configurable: true });
             Object.defineProperty(root, 'isAdsBlocked', { get: () => false, configurable: true });
-            if (root.User && typeof root.User === 'object') root.User.isVip = true;
         } catch (e) {}
     };
 
@@ -402,18 +555,20 @@ vg-quality-selector .vip-label {
         const dnIframe = document.getElementById('dn_iframe');
         if (dnIframe) dnIframe.style.display = 'none';
 
-        const dialogs = document.querySelectorAll('dn-dialog, .dn-dialog-background');
-        dialogs.forEach((el) => {
-            el.style.display = 'none';
-        });
+        // Login, playback errors and source availability dialogs must stay visible.
     };
 
+    let refreshTimer = null;
+    const scheduleRefresh = () => {
+        if (refreshTimer !== null) return;
+        refreshTimer = setTimeout(() => { refreshTimer = null; refreshDynamicFeatures(); }, 100);
+    };
     const observeDom = () => {
-        if (window.__yfsp_observer) return;
-
-        const observer = new MutationObserver(() => {
-            ensureStyle();
-            hideAds();
+        if (window.__yfsp_observer || !document.documentElement) return;
+        const selector = 'aa-videoplayer,vg-quality-selector,app-dn-menu,app-danmu-input,app-comment-box,.emoji-box,video,#dn_iframe,#coin-or-upgrade-to-skip-ad';
+        const observer = new MutationObserver(records => {
+            if (records.some(record => [...record.addedNodes, ...record.removedNodes].some(node =>
+                node.nodeType === 1 && (node.matches?.(selector) || node.querySelector?.(selector))))) scheduleRefresh();
         });
         observer.observe(document.documentElement, { childList: true, subtree: true });
         window.__yfsp_observer = observer;
@@ -513,6 +668,7 @@ vg-quality-selector .vip-label {
             clearTimeout(timer);
             timer = null;
         };
+        window.addEventListener('pagehide', cancelPendingToggle);
 
         document.addEventListener(
             'dblclick',
@@ -709,22 +865,72 @@ vg-quality-selector .vip-label {
         );
     };
 
+    const componentRegistry = new Map();
+    const featureStatus = new Map();
     const findAngularComponent = (selector, matcher) => {
         const element = document.querySelector(selector);
-        if (!element || !element.__ngContext__) return null;
-
+        if (!element || !Array.isArray(element.__ngContext__)) { componentRegistry.delete(selector); return null; }
         const context = element.__ngContext__;
-        if (!Array.isArray(context)) return null;
+        const previous = componentRegistry.get(selector);
+        if (previous?.element === element && context.includes(previous.component) && matcher(previous.component)) return previous.component;
+        const component = context.find(matcher) || null;
+        if (component) componentRegistry.set(selector, { element, component });
+        else componentRegistry.delete(selector);
+        return component;
+    };
 
-        return context.find(matcher) || null;
+    const interstitialSchedulers = new WeakSet();
+    const adNoticeTimes = new WeakMap();
+    const notifyAdSkipped = (component) => {
+        if (typeof component.filterAllAds !== 'function' || typeof component.api?.showInfo !== 'function') return;
+        const nativeSource = Function.prototype.toString.call(component.filterAllAds);
+        if (!nativeSource.includes('.boughtVideo') || !nativeSource.includes('.stopPlay()')) return;
+        const now = Date.now();
+        if (adNoticeTimes.has(component) && now - adNoticeTimes.get(component) < 8000) return;
+        adNoticeTimes.set(component, now);
+        // Reuse the site's own message, markup and duration via filterAllAds.
+        // The real stopPlay is handled separately: calling it for a prevented ad
+        // could restore an old movie position. No purchase callback is invoked.
+        const receiver = Object.create(component, {
+            pgmp: { value: { stopPlay() {} } },
+            api: { value: new Proxy(component.api, { get(api, key) {
+                if (key === 'showInfo') return (message, ...args) =>
+                    api.showInfo(typeof message === 'string' ? message.replace('{0}', '0') : message, ...args);
+                return Reflect.get(api, key, api);
+            } }) }
+        });
+        component.filterAllAds.call(receiver);
+    };
+    const patchInterstitialAds = (component) => {
+        const scheduler = component?.pgmp;
+        // Identified pgmp interface from the site's interstitial state machine.
+        // stopPlay emits ShouldBackToPlay, restoring the saved movie and position.
+        if (!scheduler || typeof scheduler.startPlay !== 'function' ||
+            typeof scheduler.stopPlay !== 'function' || typeof scheduler.needToShow !== 'function' ||
+            typeof scheduler.invokeList !== 'function') return 'unsupported';
+        if (!interstitialSchedulers.has(scheduler)) {
+            scheduler.startPlay = function(ad) {
+                if (ad) notifyAdSkipped(component);
+            }; // Prevent subsequent ad countdowns, but acknowledge real skips.
+            interstitialSchedulers.add(scheduler);
+        }
+        if (scheduler.isPlayingAds === true || component.isPlayingAds === true) {
+            scheduler.stopPlay();
+            notifyAdSkipped(component);
+        }
+        // Do not invoke skipAd/filterCallback: those paths can submit a coin payment.
     };
 
     const patchPlayerComponent = (component) => {
         if (!component || typeof component !== 'object') return;
 
+        patchServiceUser(component);
+        if (component._user) component._user = patchUserState(component._user);
+        patchInterstitialAds(component);
+
         if (!component.__yfsp_patched) {
             patchServiceUser(component);
-            if (component._user) patchUserState(component._user);
+            if (component._user) component._user = patchUserState(component._user);
 
             if (typeof component.changeBitrateIfPossible === 'function') {
                 const originalChange = component.changeBitrateIfPossible;
@@ -756,7 +962,7 @@ vg-quality-selector .vip-label {
 
         if (playerProto && !playerProto.__yfsp_speed_methods_patched) {
             Object.getOwnPropertyNames(playerProto).forEach((name) => {
-                if (!/speed|rate/i.test(name)) return;
+                if (!['changePlaybackRate','setPlaybackRate','changeSpeed','selectSpeed','selectRate'].includes(name)) return;
 
                 const fn = playerProto[name];
                 if (typeof fn !== 'function') return;
@@ -764,7 +970,7 @@ vg-quality-selector .vip-label {
 
                 playerProto[name] = function() {
                     try {
-                        if (this._user) patchUserState(this._user);
+                        if (this._user) this._user = patchUserState(this._user);
                         patchServiceUser(this);
                         patchServiceUserState(this);
                     } catch (e) {}
@@ -776,73 +982,122 @@ vg-quality-selector .vip-label {
             playerProto.__yfsp_speed_methods_patched = true;
         }
 
-        if (typeof component.checkIfNeedToggleCallback === 'function') {
+        if (typeof component.checkIfNeedToggleCallback === 'function' && !component.__yfsp_callback_installed) {
+            component.__yfsp_callback_installed = true;
             component.checkIfNeedToggleCallback = function() {
                 return true;
             };
         }
 
-        if (
-            component.isSwitching === true &&
-            component.switching !== true &&
-            component.isChanging !== true &&
-            component.changeBitrateLoading !== true &&
-            component.isLoading !== true &&
-            component.loading !== true
-        ) {
-            component.isSwitching = false;
-        }
+        // The player clears isSwitching when decoding changes. A timer must not
+        // clear it merely because unrelated loading flags happen to be absent.
+    };
+
+    const syncQualityUser = (component) => {
+        const service = compatibilityServiceSources.get(component._userService) || component._userService;
+        const user = service && 'user' in service ? service.user : component._user;
+        const real = compatibilitySources.get(user) || user;
+        const loggedIn = Number(real?.id) > 0;
+        component._user = loggedIn ? real : patchUserState(real);
+        return loggedIn;
     };
 
     const patchQualitySelectorComponent = (component) => {
         if (!component || typeof component !== 'object') return;
 
-        const changed = patchBitrates(component.bitrates);
-        if (changed) {
-            console.log('[YFSP Unlocker] Angular component patched: bitrates unlocked');
-        }
-
-        if (!component._user || typeof component._user !== 'object') {
-            component._user = { id: DEFAULT_USER_ID, roleId: DEFAULT_ROLE_ID };
-        } else {
-            if (component._user.id == null) component._user.id = DEFAULT_USER_ID;
-            if (component._user.roleId == null || component._user.roleId < 0) component._user.roleId = DEFAULT_ROLE_ID;
-        }
-
-        patchUserState(component._user);
-        if ('isVip' in component) component.isVip = true;
-        if ('hasVIP' in component) component.hasVIP = true;
-        if ('vipLevel' in component) component.vipLevel = VIP_LEVEL;
-        patchServiceUser(component);
-        patchServiceUserState(component);
+        syncQualityUser(component);
 
         const proto = Object.getPrototypeOf(component);
         if (!proto || typeof proto.selectBitrate !== 'function' || proto.__yfsp_select_patched) return;
 
         const originalSelect = proto.selectBitrate;
+        const hasClientOnlyGate = Function.prototype.toString.call(originalSelect).includes('4k-ask-app-download-dialog');
         proto.selectBitrate = function(item) {
-            try {
-                if (item && typeof item === 'object') unlockItemFlags(item);
-
-                if (this && this._user) patchUserState(this._user);
-                if (this) {
-                    patchServiceUser(this);
-                    patchServiceUserState(this);
+            // Resolve the real account every click, including login/logout while
+            // this component is alive. A UI compatibility role is not ownership.
+            const loggedIn = syncQualityUser(this);
+            if (!loggedIn && item && this.bitrateSelected?.key !== item.key) {
+                const player = findAngularComponent('aa-videoplayer',
+                    entry => entry && typeof entry.onSelectBitrate === 'function');
+                const route = resolveStandardQualityRoute(item, player, getVideoHls(findMainVideoElement()));
+                if (route.kind === 'pending') {
+                    showPlaybackNotice('正在读取播放列表，已保留原画质，请稍后重试。');
+                    return;
                 }
-
-                if (item && item.path === null) {
-                    console.log('[YFSP Unlocker] 1080P/720P path is null (server-side restriction). Cannot switch.');
-                    if (this.bitrates) {
-                        const fallback = this.bitrates.find(
-                            (bitrate) => bitrate.bitrate === 576 || bitrate.label === '576P' || bitrate.qualityIndex === 0
-                        );
-                        if (fallback && fallback.path) {
-                            console.log('[YFSP Unlocker] Spoofing 1080P with 576P source to bypass null path');
-                            item.path = fallback.path;
-                        }
+                if (route.kind === 'delegate' && !hasPlayablePath(item)) {
+                    showPlaybackNotice('暂时无法确认此清晰度对应的播放地址，已保留原画质。可稍后重试或选择其他清晰度。');
+                    return;
+                }
+                if (route.kind !== 'master' && route.kind !== 'source' && !hasPlayablePath(item)) {
+                    showPlaybackNotice('当前清晰度没有可用的播放地址，已保留原画质。可尝试其他清晰度，或登录后重试。');
+                    return;
+                }
+                if (route.kind === 'master') item.qualityIndex = route.index;
+            }
+            if (readPreference('yfsp.playbackOnly', false) && Number(item?.bitrate) > 1080) {
+                return originalSelect.call(this, item);
+            }
+            if (hasClientOnlyGate && Number(item?.bitrate) <= 1080) {
+                const needsAccountFlow = item.isVIP && (!this._user?.id ||
+                    (!item.isBought && this._user?.roleId === 0));
+                if (!needsAccountFlow && this.bitrateSelected?.key !== item.key) {
+                    const player = findAngularComponent('aa-videoplayer',
+                        entry => entry && typeof entry.onSelectBitrate === 'function');
+                    const route = resolveStandardQualityRoute(item, player, getVideoHls(findMainVideoElement()));
+                    if (route.kind === 'pending') {
+                        showPlaybackNotice('正在读取播放列表，已保留原画质，请稍后重试。');
+                        return;
+                    }
+                    if (route.kind === 'unavailable') {
+                        showPlaybackNotice('当前播放列表没有此画质的层级，也未返回独立源；保留正在播放的画质。');
+                        return;
+                    }
+                    if (route.kind === 'master') item.qualityIndex = route.index;
+                    if (this._utility && Number.isFinite(this.API?.currentTime)) {
+                        this._utility.preLoadPlaySecond = this.API.currentTime;
                     }
                 }
-            } catch (e) {}
+                return originalSelect.call(this, item);
+            }
+            // Null paths may trigger login, purchase or manifest-level selection.
+            // Only adapt the known desktop-only gate; delegate other choices intact.
+            if (hasClientOnlyGate && Number(item?.bitrate) > 1080 &&
+                typeof this?.onBitrateChange?.emit === 'function') {
+                if (item.key != null && this.bitrateSelected?.key === item.key) return;
+                if (item.isVIP && !this._user?.id) {
+                    if (typeof this._userService?.showLoginDialog !== 'function') return originalSelect.call(this, item);
+                    if (this.fsAPI?.isFullscreen) this.fsAPI.toggleFullscreen();
+                    return this._userService.showLoginDialog(true);
+                }
+                if (item.isVIP && !item.isBought && this._user && this._user.roleId === 0) {
+                    if (typeof this._purchaseRequiredDialogService?.setState !== 'function' ||
+                        typeof this._dnDialogService?.open !== 'function') return originalSelect.call(this, item);
+                    if (this.fsAPI?.isFullscreen) this.fsAPI.toggleFullscreen();
+                    this._purchaseRequiredDialogService.setState({
+                        price: this.gold, mediaId: item.key, isShortDrama: this.isShortDrama
+                    });
+                    return this._dnDialogService.open('purchase-required', {
+                        'purchase-required-price': this.gold, 'media-id': item.key,
+                        isLive: this.isLive, isShortDrama: this.isShortDrama
+                    });
+                }
+                if (!hasPlayablePath(item)) {
+                    showPlaybackNotice('当前未返回此画质的独立源；保留正在播放的画质。');
+                    return;
+                }
+                // Keep the actual source/key and the normal player event chain.
+                // This removes only the desktop-app prompt, not server checks.
+                if (this._utility && Number.isFinite(this.API?.currentTime)) {
+                    this._utility.preLoadPlaySecond = this.API.currentTime;
+                }
+                this.bitrateSelected = item;
+                this.onBitrateChange.emit(item);
+                this.isActive = this.isOpen = false;
+                this.openList?.unsubscribe?.();
+                this.hiddenApi?.releaseControls?.();
+                showPlaybackNotice('已请求切换高清源；实际画质以视频分辨率为准。');
+                return;
+            }
             return originalSelect.call(this, item);
         };
 
@@ -853,7 +1108,7 @@ vg-quality-selector .vip-label {
     const patchDanmuComponent = (component) => {
         if (!component || typeof component !== 'object') return;
 
-        patchUserState(component.user);
+        component.user = patchUserState(component.user);
         patchServiceUser(component);
 
         [component.typeList, component.colorList, component.styleList, component.fontList, component.speedList].forEach(unlockList);
@@ -869,7 +1124,7 @@ vg-quality-selector .vip-label {
                 const originalUpdate = component.danmuFacade.updateUserSettings;
                 component.danmuFacade.updateUserSettings = function() {
                     try {
-                        if (component.user) patchUserState(component.user);
+                        if (component.user) component.user = patchUserState(component.user);
                         patchServiceUser(component);
                     } catch (e) {}
                     return originalUpdate.apply(this, arguments);
@@ -885,7 +1140,7 @@ vg-quality-selector .vip-label {
             const originalSelectColor = proto.selectColor;
             proto.selectColor = function(item) {
                 try {
-                    patchUserState(this.user);
+                    this.user = patchUserState(this.user);
                     patchServiceUser(this);
 
                     if (item && typeof item === 'object' && this.danmuFacade && typeof this.danmuFacade.setOutputColor === 'function') {
@@ -904,7 +1159,7 @@ vg-quality-selector .vip-label {
             const originalSelectType = proto.selectType;
             proto.selectType = function(item) {
                 try {
-                    patchUserState(this.user);
+                    this.user = patchUserState(this.user);
                     patchServiceUser(this);
                     if (!this.user && this._userService && this._userService.user) this.user = this._userService.user;
 
@@ -924,7 +1179,7 @@ vg-quality-selector .vip-label {
             const originalToggleAvatar = proto.toggleIncludeAvatar;
             proto.toggleIncludeAvatar = function() {
                 try {
-                    patchUserState(this.user);
+                    this.user = patchUserState(this.user);
                     patchServiceUser(this);
                     if (!this.user && this._userService && this._userService.user) this.user = this._userService.user;
                     this.includeAvatar = !this.includeAvatar;
@@ -945,7 +1200,7 @@ vg-quality-selector .vip-label {
             const originalToggleLocation = proto.toggleIncludeLocation;
             proto.toggleIncludeLocation = function() {
                 try {
-                    patchUserState(this.user);
+                    this.user = patchUserState(this.user);
                     patchServiceUser(this);
                     if (!this.user && this._userService && this._userService.user) this.user = this._userService.user;
                     this.includeLocation = !this.includeLocation;
@@ -966,7 +1221,7 @@ vg-quality-selector .vip-label {
     const patchCommentComponent = (component) => {
         if (!component || typeof component !== 'object') return;
 
-        patchUserState(component.user);
+        component.user = patchUserState(component.user);
         patchServiceUser(component);
         patchServiceUserState(component);
 
@@ -976,7 +1231,7 @@ vg-quality-selector .vip-label {
         const originalOpenVote = proto.openVotingCreatorDialog;
         proto.openVotingCreatorDialog = function() {
             try {
-                if (this.user) patchUserState(this.user);
+                if (this.user) this.user = patchUserState(this.user);
                 patchServiceUser(this);
                 this.showVotingCreator = true;
                 return;
@@ -990,7 +1245,7 @@ vg-quality-selector .vip-label {
     const patchEmojiComponent = (component) => {
         if (!component || typeof component !== 'object') return;
 
-        patchUserState(component.user);
+        component.user = patchUserState(component.user);
         patchServiceUser(component);
 
         const proto = Object.getPrototypeOf(component);
@@ -1002,64 +1257,58 @@ vg-quality-selector .vip-label {
         proto.__yfsp_vip_emoji_patched = true;
     };
 
-    const hookAngular = () => {
+    const runFeature = (name, work) => {
         try {
-            const playerComponent = findAngularComponent(
-                'aa-videoplayer',
-                (entry) => entry && typeof entry === 'object' && entry.playerMediaListService
-            );
-            if (playerComponent) patchPlayerComponent(playerComponent);
-
-            const qualityComponent = findAngularComponent(
-                'vg-quality-selector',
-                (entry) => entry && typeof entry === 'object' && entry.bitrates && entry.bitrateSelected
-            );
-            if (!qualityComponent) return;
-            patchQualitySelectorComponent(qualityComponent);
-
-            const danmuComponent = findAngularComponent(
-                'app-danmu-input',
-                (entry) => entry && typeof entry === 'object' && entry.typeList && entry.colorList && entry.danmuFacade
-            );
-            if (danmuComponent) patchDanmuComponent(danmuComponent);
-
-            const commentComponent = findAngularComponent(
-                'app-comment-box',
-                (entry) => entry && typeof entry === 'object' && entry._commentService && entry._emojiPickerService
-            );
-            if (commentComponent) patchCommentComponent(commentComponent);
-
-            const emojiComponent = findAngularComponent(
-                '.emoji-box',
-                (entry) => entry && typeof entry === 'object' && entry._permission && entry.emojiSets
-            );
-            if (emojiComponent) patchEmojiComponent(emojiComponent);
-        } catch (e) {
-            console.log('[YFSP Unlocker] Angular hook error:', e);
+            const result = work();
+            featureStatus.set(name, result === false ? 'waiting' : result === 'unsupported' ? 'unsupported' : 'installed');
         }
+        catch { featureStatus.set(name, 'failed'); }
     };
-
-    const bootstrap = () => {
-        hookFetch(window);
-        hookXhr(window);
-
-        if (typeof unsafeWindow !== 'undefined') {
-            hookFetch(unsafeWindow);
-            hookXhr(unsafeWindow);
-            applyGlobals(unsafeWindow);
-        }
-
-        applyGlobals(window);
-        ensureStyle();
-        hideAds();
-        observeDom();
-        installClickToggle();
-        installFullscreenControlReveal();
-        installContainerFullscreenHijack();
+    const hookAngular = () => {
+        const install = (name, selector, matcher, patch) => runFeature(name, () => {
+            const component = findAngularComponent(selector, matcher);
+            if (!component) return false;
+            return patch(component);
+        });
+        install('ads', 'aa-videoplayer', entry => entry?.pgmp, patchInterstitialAds);
+        install('quality', 'vg-quality-selector', entry => typeof entry?.selectBitrate === 'function', patchQualitySelectorComponent);
+        if (readPreference('yfsp.playbackOnly', false)) return;
+        install('player', 'aa-videoplayer', entry => entry?.playerMediaListService, patchPlayerComponent);
+        install('danmu', 'app-danmu-input', entry => entry?.typeList && entry.colorList && entry.danmuFacade, patchDanmuComponent);
+        install('comment', 'app-comment-box', entry => entry?._commentService && entry._emojiPickerService, patchCommentComponent);
+        install('emoji', '.emoji-box', entry => entry?._permission && entry.emojiSets, patchEmojiComponent);
+    };
+    const refreshDynamicFeatures = () => {
+        runFeature('style', () => { ensureStyle(); hideAds(); });
         hookAngular();
+        runFeature('check-in', autoCheckIn);
+        runFeature('playback-status', updatePlaybackExperience);
+    };
+    const bootstrap = () => {
+        for (const root of new Set([window, typeof unsafeWindow !== 'undefined' ? unsafeWindow : window])) {
+            hookFetch(root); hookXhr(root); applyGlobals(root);
+        }
+        observeDom(); installClickToggle(); installFullscreenControlReveal(); installContainerFullscreenHijack();
+        refreshDynamicFeatures();
+    };
+    let bootstrapTimer = null;
+    const startRuntime = () => {
+        bootstrap();
+        if (bootstrapTimer === null) bootstrapTimer = setInterval(refreshDynamicFeatures, BOOTSTRAP_INTERVAL_MS);
+    };
+    const stopRuntime = () => {
+        clearInterval(bootstrapTimer); clearTimeout(refreshTimer);
+        bootstrapTimer = refreshTimer = null;
+        window.__yfsp_observer?.disconnect(); window.__yfsp_observer = null;
+        componentRegistry.clear(); restoreBufferConfig();
     };
 
-    bootstrap();
+
+
+    installClientIdentity();
+    installPlaybackMenus();
+    startRuntime();
     document.addEventListener('DOMContentLoaded', bootstrap, { once: true });
-    setInterval(bootstrap, BOOTSTRAP_INTERVAL_MS);
+    window.addEventListener('pagehide', stopRuntime);
+    window.addEventListener('pageshow', startRuntime);
 })();

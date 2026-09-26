@@ -1,13 +1,14 @@
 ﻿// ==UserScript==
 // @name         syysj-filter
 // @namespace    http://tampermonkey.net/
-// @version      1.4.0
+// @version      1.5.0
 // @description  Forum non-male filter (male tag OR card gender=male) with blacklist/whitelist controls on profile hover cards, space page, and thread favatar.
 // @author       Codex
 // @match        *://*/main/forum.php*
 // @match        *://*/main/home.php*
 // @run-at       document-end
 // @grant        GM_getValue
+// @grant        GM_addValueChangeListener
 // @grant        GM_setValue
 // @homepage     https://github.com/Suysker/scripts-monorepo/tree/main/discuz-forum-filter
 // @supportURL   https://github.com/Suysker/scripts-monorepo/issues
@@ -36,7 +37,7 @@
 
     if (!isAllowedRuntimeHost(location.hostname)) return;
 
-    const pageInfo = detectPage();
+    let pageInfo = detectPage();
     if (!pageInfo.supported) return;
 
     const state = {
@@ -60,7 +61,11 @@
         autoFillQueued: false,
         autoFillToken: 0,
 
-        loadedThreadKeys: new Set()
+        loadedThreadKeys: new Set(),
+        genderHead: 0, genderAttempts: new Map(), genderControllers: new Set(), retryTimers: new Set(),
+        genderSaveTimer: null, suspended: false, autoFillTimer: null, autoFillController: null,
+        fetchedPageCount: 0, visitedPages: new Set(), fillBudget: AUTO_FILL_MAX_PAGES,
+        nextCursor: undefined, exhausted: false, tailPage: 0, nextFillAt: 0, generation: 0
     };
 
     const LIST_META = {
@@ -173,39 +178,47 @@
 
     function loadGenderMap(key) {
         try {
-            const parsed = GM_getValue(key, null);
-            if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return {};
-
+            const stored = GM_getValue(key + '.v2', null);
+            if (stored && stored.schema !== 2) return {};
+            const raw = stored?.entries || GM_getValue(key, {});
             const cleaned = {};
-            for (const [uid, value] of Object.entries(parsed)) {
-                if (!uid || !/^\d+$/.test(uid)) continue;
-                const code = Number(value);
-                if (isValidGenderCode(code)) cleaned[uid] = code;
+            for (const [uid,value] of Object.entries(raw || {})) {
+                if (!/^\d+$/.test(uid)) continue;
+                const code = typeof value === 'object' ? value?.code : Number(value);
+                const stamp = Number(value?.updatedAt);
+                if (value !== null && isValidGenderCode(code)) cleaned[uid] = {code,updatedAt:Number.isFinite(stamp) && stamp > 0 && stamp <= Date.now() ? stamp : 0};
             }
-            return cleaned;
-        } catch {
-            return {};
-        }
+            return Object.fromEntries(Object.entries(cleaned).sort((a,b)=>b[1].updatedAt-a[1].updatedAt).slice(0,5000));
+        } catch { return {}; }
     }
-
+    function flushGenderMap() {
+        clearTimeout(state.genderSaveTimer); state.genderSaveTimer = null;
+        try {
+            const persisted = GM_getValue(STORAGE_KEY_GENDER_MAP + '.v2', null);
+            if (persisted && persisted.schema !== 2) return;
+            const merged = {...loadGenderMap(STORAGE_KEY_GENDER_MAP)};
+            for (const [uid,entry] of Object.entries(state.genderMap)) {
+                if (!merged[uid] || entry.updatedAt >= merged[uid].updatedAt) merged[uid] = entry;
+            }
+            state.genderMap = Object.fromEntries(Object.entries(merged).sort((a,b)=>b[1].updatedAt-a[1].updatedAt).slice(0,5000));
+            GM_setValue(STORAGE_KEY_GENDER_MAP + '.v2', {schema:2,entries:state.genderMap});
+        } catch { /* Keep the in-memory cache and original v1 data. */ }
+    }
     function saveGenderMap() {
-        GM_setValue(STORAGE_KEY_GENDER_MAP, state.genderMap);
+        if (state.genderSaveTimer === null) state.genderSaveTimer = setTimeout(flushGenderMap,500);
     }
-
     function readGenderCode(uid) {
-        if (!uid) return null;
-        const code = state.genderMap[uid];
-        if (isValidGenderCode(code)) return code;
-        return null;
+        const entry = state.genderMap[uid];
+        if (!entry || !isValidGenderCode(entry.code)) return null;
+        if (Date.now() - entry.updatedAt > 30*86400000) queueGenderFetch(uid, true);
+        return entry.code;
     }
-
     function writeGenderCode(uid, code) {
-        if (!uid) return false;
-        if (!isValidGenderCode(code)) return false;
-        if (state.genderMap[uid] === code) return false;
-        state.genderMap[uid] = code;
-        saveGenderMap();
-        return true;
+        if (!uid || !isValidGenderCode(code)) return false;
+        const changed = state.genderMap[uid]?.code !== code;
+        state.genderMap[uid] = {code,updatedAt:Date.now()}; saveGenderMap();
+        if (changed) queueGenderRows(uid);
+        return changed;
     }
 
     function extractGenderCodeFromText(text) {
@@ -217,7 +230,7 @@
 
     function setGenderAttr(node, genderCode) {
         if (!node) return;
-        if (isValidGenderCode(genderCode)) node.setAttribute('data-syysj-gender', String(genderCode));
+        if (isValidGenderCode(genderCode)) { if (node.getAttribute('data-syysj-gender') !== String(genderCode)) node.setAttribute('data-syysj-gender', String(genderCode)); }
         else node.removeAttribute('data-syysj-gender');
     }
 
@@ -232,46 +245,47 @@
     }
 
     async function fetchGenderCodeByCard(uid) {
-        const url = buildUserCardRequestUrl(uid);
-        const response = await fetch(url, { credentials: 'include' });
-        if (!response.ok) return null;
-
-        const text = await response.text();
-        return extractGenderCodeFromText(text);
+        const controller = new AbortController(); state.genderControllers.add(controller);
+        const timer = setTimeout(()=>controller.abort(),12000);
+        try {
+            const response = await fetch(buildUserCardRequestUrl(uid), {credentials:'include',signal:controller.signal});
+            if (!response.ok) return null;
+            return extractGenderCodeFromText(await response.text());
+        } finally { clearTimeout(timer); state.genderControllers.delete(controller); }
     }
-
-    function queueGenderFetch(uid) {
-        if (!uid) return;
-        if (readGenderCode(uid) !== null) return;
-        if (state.pendingGenderUids.has(uid)) return;
-        if (state.requestedGenderUids.has(uid)) return;
-
-        state.requestedGenderUids.add(uid);
-        state.pendingGenderUids.add(uid);
-        state.genderFetchQueue.push(uid);
-        drainGenderFetchQueue();
+    function queueGenderFetch(uid, refresh = false) {
+        if (!uid || state.suspended || state.pendingGenderUids.has(uid) || state.requestedGenderUids.has(uid)) return;
+        if (!refresh && state.genderMap[uid]) return;
+        if ((state.genderAttempts.get(uid) || 0) >= 3) return;
+        state.requestedGenderUids.add(uid); state.pendingGenderUids.add(uid);
+        state.genderFetchQueue.push(uid); drainGenderFetchQueue();
     }
-
     function drainGenderFetchQueue() {
-        while (state.activeGenderFetches < MAX_CONCURRENT_GENDER_FETCH && state.genderFetchQueue.length > 0) {
-            const uid = state.genderFetchQueue.shift();
-            state.activeGenderFetches += 1;
-
-            fetchGenderCodeByCard(uid)
-                .then((code) => {
-                    if (code !== null) writeGenderCode(uid, code);
-                })
-                .catch((error) => {
-                    console.error('[syysj gender] fetch failed:', uid, error);
-                })
-                .finally(() => {
-                    state.pendingGenderUids.delete(uid);
-                    state.activeGenderFetches -= 1;
-                    queueApplyCurrentPage();
-
-                    drainGenderFetchQueue();
-                });
+        while (!state.suspended && state.activeGenderFetches < MAX_CONCURRENT_GENDER_FETCH && state.genderHead < state.genderFetchQueue.length) {
+            const uid = state.genderFetchQueue[state.genderHead++]; state.activeGenderFetches++;
+            const previousEntry = state.genderMap[uid];
+            const generation = state.generation;
+            state.genderAttempts.set(uid,(state.genderAttempts.get(uid) || 0)+1);
+            let success = false;
+            fetchGenderCodeByCard(uid).then(code => {
+                if (code !== null && !state.suspended && generation === state.generation) {
+                    success=true;
+                    // A visible profile card may have supplied fresher information.
+                    if (state.genderMap[uid] === previousEntry) writeGenderCode(uid,code);
+                }
+            }).catch(()=>{}).finally(()=>{
+                if (generation === state.generation) state.pendingGenderUids.delete(uid);
+                state.activeGenderFetches--;
+                if (!success && !state.suspended && generation === state.generation && state.genderAttempts.get(uid) < 3) {
+                    const timer=setTimeout(()=>{
+                        state.retryTimers.delete(timer); state.requestedGenderUids.delete(uid); queueGenderFetch(uid,true);
+                    },30000 * state.genderAttempts.get(uid));
+                    state.retryTimers.add(timer);
+                }
+                drainGenderFetchQueue();
+            });
         }
+        if (state.genderHead === state.genderFetchQueue.length) { state.genderFetchQueue=[]; state.genderHead=0; }
     }
 
     function ensureStyle() {
@@ -440,7 +454,10 @@ a.syysj-page-jump {
         saveUserMap(STORAGE_KEY_WHITELIST, state.whitelist);
     }
 
+    function reloadLists() { state.blacklist=loadUserMap(STORAGE_KEY_BLACKLIST); state.whitelist=loadUserMap(STORAGE_KEY_WHITELIST); }
+
     function addToList(listName, meta) {
+        reloadLists();
         if (!meta || !meta.userKey) return;
 
         const target = listName === 'whitelist' ? state.whitelist : state.blacklist;
@@ -457,6 +474,7 @@ a.syysj-page-jump {
     }
 
     function removeFromList(listName, meta) {
+        reloadLists();
         if (!meta || !meta.userKey) return;
         const target = listName === 'whitelist' ? state.whitelist : state.blacklist;
         if (!target[meta.userKey]) return;
@@ -467,6 +485,9 @@ a.syysj-page-jump {
     function stopAutoFillSoon() {
         // 令牌 +1：让正在执行的补齐循环尽快停止
         state.autoFillToken += 1;
+        clearTimeout(state.autoFillTimer); state.autoFillTimer=null; state.autoFillQueued=false;
+        state.autoFillController?.abort();
+        state.autoFillController=null; state.loadingMore=false;
         setAutoFillStatus('');
     }
 
@@ -485,6 +506,7 @@ a.syysj-page-jump {
     }
 
     function clearUserList(listName) {
+        reloadLists();
         if (listName === 'whitelist') state.whitelist = {};
         else state.blacklist = {};
         saveAllLists();
@@ -742,6 +764,7 @@ a.syysj-page-jump {
     <button type="button" class="syysj-btn" data-action="manage-blacklist">管理黑名单</button>
     <button type="button" class="syysj-btn" data-action="manage-whitelist">管理白名单</button>
     <span class="syysj-stat" data-role="stats"></span>
+    <button type="button" class="syysj-btn" data-action="continue-fill" hidden>继续补充</button>
     <span class="syysj-autofill" data-role="autofill"></span>
 </div>
         `;
@@ -761,6 +784,10 @@ a.syysj-page-jump {
         if (manageBlacklistButton) manageBlacklistButton.addEventListener('click', () => openUserListManager('blacklist'));
         if (manageWhitelistButton) manageWhitelistButton.addEventListener('click', () => openUserListManager('whitelist'));
 
+        toolbar.querySelector('[data-action="continue-fill"]').addEventListener('click', () => {
+            state.fillBudget += AUTO_FILL_MAX_PAGES;
+            queueApplyCurrentPage();
+        });
         threadList.parentNode.insertBefore(toolbar, threadList);
         return toolbar;
     }
@@ -770,7 +797,9 @@ a.syysj-page-jump {
         if (!toolbar) return;
         const node = toolbar.querySelector('[data-role="autofill"]');
         if (!node) return;
-        node.textContent = text || '';
+        if (node.textContent !== (text || '')) node.textContent = text || '';
+        const more=toolbar.querySelector('[data-action="continue-fill"]');
+        if (more) more.hidden=state.exhausted || state.fetchedPageCount < state.fillBudget;
     }
 
     function updateToolbar(stats) {
@@ -936,7 +965,7 @@ a.syysj-page-jump {
         });
     }
 
-    function findNextPageUrl(docRoot) {
+    function findNextPageUrl(docRoot, baseUrl = location.href) {
         const nxt =
             docRoot.querySelector('#pgt .pg a.nxt') ||
             docRoot.querySelector('#pg .pg a.nxt') ||
@@ -948,7 +977,10 @@ a.syysj-page-jump {
         if (!href || href.startsWith('javascript')) return null;
 
         try {
-            return new URL(href, location.href).toString();
+            const url = new URL(href, baseUrl);
+            if (url.origin !== location.origin || url.pathname !== location.pathname || url.searchParams.get('mod') !== 'forumdisplay' || url.searchParams.get('fid') !== pageInfo.params.get('fid')) return null;
+            const page = Number(url.searchParams.get('page'));
+            return Number.isSafeInteger(page) && page > 0 ? url.toString() : null;
         } catch {
             return null;
         }
@@ -990,6 +1022,7 @@ a.syysj-page-jump {
         const refNode = getThreadAppendRefNode(table);
 
         let appended = 0;
+        const fragment = document.createDocumentFragment();
 
         for (const row of rows) {
             if (!row || row.id === 'separatorline') continue;
@@ -1003,19 +1036,20 @@ a.syysj-page-jump {
             // 给合并进来的行打标：来源页号
             cloned.setAttribute('data-syysj-page', String(sourcePageNo));
 
-            if (refNode) table.insertBefore(cloned, refNode);
-            else table.appendChild(cloned);
+            fragment.appendChild(cloned);
 
             if (key) state.loadedThreadKeys.add(key);
             appended += 1;
         }
 
+        table.insertBefore(fragment, refNode);
         return appended;
     }
 
     async function autoFillToThresholdIfNeeded(currentStats) {
         if (!pageInfo.isForumDisplay) return;
-        if (state.loadingMore) return;
+        if (state.loadingMore || state.suspended || state.exhausted || Date.now() < state.nextFillAt) return;
+        if (state.fetchedPageCount >= state.fillBudget) { setAutoFillStatus("已达到本页自动补充上限，可点击继续补充。"); return; }
 
         // 只在“确实会减少可见数量”的过滤条件存在时才补齐
         const filteringActive = state.filterMale || Object.keys(state.blacklist).length > 0;
@@ -1033,8 +1067,9 @@ a.syysj-page-jump {
         if (state.autoFillQueued) return;
         state.autoFillQueued = true;
 
-        setTimeout(async () => {
-            state.autoFillQueued = false;
+        state.autoFillTimer = setTimeout(async () => {
+            state.autoFillTimer=null; state.autoFillQueued = false;
+            if (state.suspended || !(state.filterMale || Object.keys(state.blacklist).length)) return;
 
             const table = document.getElementById('threadlisttableid');
             if (!table) return;
@@ -1054,15 +1089,16 @@ a.syysj-page-jump {
                     return;
                 }
 
-                let nextUrl = findNextPageUrl(document);
+                let nextUrl = state.nextCursor === undefined ? findNextPageUrl(document) : state.nextCursor;
+                if (!nextUrl) state.exhausted = true;
                 let fetchedPages = 0;
-                let tailPage = basePage;
+                let tailPage = Math.max(basePage, state.tailPage);
 
                 while (
                     myToken === state.autoFillToken &&
                     stats.visible < AUTO_FILL_MIN_VISIBLE &&
                     nextUrl &&
-                    fetchedPages < AUTO_FILL_MAX_PAGES
+                    fetchedPages < AUTO_FILL_MAX_PAGES && state.fetchedPageCount < state.fillBudget
                 ) {
                     const nextPageNo = getPageNumberFromUrl(nextUrl);
                     // 如果解析不到页号，就按递增猜；但一般 Discuz 都能解析到
@@ -1070,27 +1106,38 @@ a.syysj-page-jump {
 
                     setAutoFillStatus(`补充中… ${stats.visible}/${AUTO_FILL_MIN_VISIBLE}（加载第${sourcePageNo}页）`);
 
-                    let resp;
+                    if (state.visitedPages.has(nextUrl)) { state.exhausted=true; break; }
+                    let resp, html;
                     try {
-                        resp = await fetch(nextUrl, { credentials: 'include' });
+                        state.autoFillController=new AbortController();
+                        const controller = state.autoFillController;
+                        const timeout=setTimeout(()=>controller.abort(),15000);
+                        state.fetchedPageCount++;
+                        try {
+                            resp = await fetch(nextUrl, {credentials:'include',signal:controller.signal});
+                            if (resp.ok) html = await resp.text();
+                        }
+                        finally { clearTimeout(timeout); }
                     } catch (e) {
-                        console.error('[syysj autofill] fetch error:', e);
+                        if (myToken === state.autoFillToken) state.nextFillAt = Date.now() + 30000;
                         break;
                     }
-                    if (!resp || !resp.ok) break;
+                    if (myToken !== state.autoFillToken) break;
+                    if (!resp || !resp.ok) { state.nextFillAt = Date.now() + 30000; break; }
 
-                    const html = await resp.text();
                     if (myToken !== state.autoFillToken) break;
 
+                    state.visitedPages.add(nextUrl);
                     const parsed = new DOMParser().parseFromString(html, 'text/html');
 
                     const appended = appendThreadRowsFromDoc(parsed, sourcePageNo);
 
-                    nextUrl = findNextPageUrl(parsed);
+                    nextUrl = findNextPageUrl(parsed, resp.url || nextUrl);
+                    state.nextCursor=nextUrl; state.exhausted=!nextUrl;
                     fetchedPages += 1;
-                    tailPage = Math.max(tailPage, sourcePageNo);
+                    tailPage = Math.max(tailPage, sourcePageNo); state.tailPage=tailPage;
 
-                    if (appended === 0) break;
+                    if (appended === 0) { state.exhausted=true; break; }
 
                     stats = applyForumDisplayFiltering(true);
                     queueInstallUserControls();
@@ -1099,6 +1146,7 @@ a.syysj-page-jump {
                 // 关键：补齐结束后，进入“合并分页语义”
                 // nextUrl 此时代表：第一个尚未合并的下一页（如果存在）
                 // tailPage = 已合并到的最后页
+                if (myToken !== state.autoFillToken) return;
                 if (tailPage > basePage) {
                     patchPagerAfterMerge({ basePage, tailPage, nextUrl, fetchedPages });
                 }
@@ -1113,10 +1161,12 @@ a.syysj-page-jump {
                     setAutoFillStatus(`补充结束：${stats.visible}/${AUTO_FILL_MIN_VISIBLE}（合并至第${tailPage}页）`);
                 }
             } catch (e) {
-                console.error('[syysj autofill] failed:', e);
-                setAutoFillStatus('补充失败（控制台可看日志）');
+                if (myToken === state.autoFillToken) {
+                    console.error('[syysj autofill] failed:', e);
+                    setAutoFillStatus('补充失败（控制台可看日志）');
+                }
             } finally {
-                state.loadingMore = false;
+                if (myToken === state.autoFillToken) { state.loadingMore = false; state.autoFillController=null; }
             }
         }, AUTO_FILL_DEBOUNCE_MS);
     }
@@ -1125,82 +1175,56 @@ a.syysj-page-jump {
     // Forumdisplay filtering
     // -----------------------------
 
-    function applyForumDisplayFiltering(fromAutoFill = false) {
-        const rows = getThreadRows();
-        if (rows.length === 0) {
-            const stats0 = { total: 0, visible: 0, hidden: 0, hiddenByMale: 0, hiddenByBlacklist: 0, visibleByWhitelist: 0 };
-            syncForumSeparatorVisibility(0, 0);
-            updateToolbar(stats0);
-            return stats0;
-        }
-
-        let total = 0;
-        let visible = 0;
-        let hiddenByMale = 0;
-        let hiddenByBlacklist = 0;
-        let visibleByWhitelist = 0;
-        let visibleStickyRows = 0;
-        let visibleNormalRows = 0;
-
-        rows.forEach((row) => {
-            if (!row || row.id === 'separatorline') return;
-
-            total += 1;
-            const meta = readRowMeta(row);
-            if (!meta) {
-                setGenderAttr(row, null);
-                row.style.display = '';
-                visible += 1;
-                if (row.id.startsWith('stickthread_')) visibleStickyRows += 1;
-                else if (row.id.startsWith('normalthread_')) visibleNormalRows += 1;
-                return;
+    const uidRows = new Map(), rowOutcomes = new Map();
+    const totals = {total:0,visible:0,hidden:0,hiddenByMale:0,hiddenByBlacklist:0,visibleByWhitelist:0,sticky:0,normal:0};
+    const dirtyUids = new Set();
+    let genderFrame = null;
+    function queueGenderRows(uid) {
+        dirtyUids.add(uid);
+        if (genderFrame !== null || state.suspended) return;
+        genderFrame=requestAnimationFrame(()=>{
+            genderFrame=null;
+            for (const uid of dirtyUids) for (const row of uidRows.get(uid) || []) {
+                if (!row.isConnected) continue;
+                if (pageInfo.isForumDisplay) updateForumRow(row);
+                else updatePostRow(row);
             }
-
-            setGenderAttr(row, meta.genderCode);
-            const visibility = evaluateVisibility(meta, isMaleQualified(meta));
-            const { whitelisted, blacklisted, shouldHide } = visibility;
-
-            row.style.display = shouldHide ? 'none' : '';
-
-            if (shouldHide) {
-                if (blacklisted) hiddenByBlacklist += 1;
-                else hiddenByMale += 1;
-            } else {
-                visible += 1;
-                if (whitelisted) visibleByWhitelist += 1;
-                if (row.id.startsWith('stickthread_')) visibleStickyRows += 1;
-                else if (row.id.startsWith('normalthread_')) visibleNormalRows += 1;
-            }
+            dirtyUids.clear();
+            if (pageInfo.isForumDisplay) publishForumStats(false);
         });
-
-        syncForumSeparatorVisibility(visibleStickyRows, visibleNormalRows);
-
-        const stats = {
-            total,
-            visible,
-            hidden: total - visible,
-            hiddenByMale,
-            hiddenByBlacklist,
-            visibleByWhitelist
-        };
-
-        updateToolbar(stats);
-
-        // 避免递归：补齐内部调用(fromAutoFill=true)不触发补齐；
-        // 补齐进行中(state.loadingMore=true)也不再次触发。
-        if (pageInfo.isForumDisplay && !fromAutoFill && !state.loadingMore) {
-            autoFillToThresholdIfNeeded(stats);
-        }
-
+    }
+    function indexRow(uid,row) { if (uid) { if (!uidRows.has(uid)) uidRows.set(uid,new Set()); uidRows.get(uid).add(row); } }
+    function setRowDisplay(row,hide) { const value=hide?'none':''; if(row.style.display!==value)row.style.display=value; }
+    function updateForumRow(row) {
+        const previous=rowOutcomes.get(row); if(previous)for(const key in totals)totals[key]-=previous[key];
+        const meta=readRowMeta(row); if(meta)indexRow(meta.uid,row);
+        const visibility=evaluateVisibility(meta,isMaleQualified(meta));
+        const visible=!visibility.shouldHide;
+        setGenderAttr(row,meta?.genderCode); setRowDisplay(row,!visible);
+        const outcome={total:1,visible:+visible,hidden:+!visible,
+            hiddenByMale:+(!visible&&!visibility.blacklisted),hiddenByBlacklist:+(!visible&&visibility.blacklisted),
+            visibleByWhitelist:+(visible&&visibility.whitelisted),sticky:+(visible&&row.id.startsWith('stickthread_')),normal:+(visible&&row.id.startsWith('normalthread_'))};
+        rowOutcomes.set(row,outcome); for(const key in totals)totals[key]+=outcome[key];
+    }
+    function publishForumStats(fromAutoFill) {
+        syncForumSeparatorVisibility(totals.sticky,totals.normal); updateToolbar(totals);
+        const stats={...totals};
+        if (!fromAutoFill && !state.loadingMore) autoFillToThresholdIfNeeded(stats);
         return stats;
+    }
+    function applyForumDisplayFiltering(fromAutoFill = false) {
+        uidRows.clear(); rowOutcomes.clear(); for(const key in totals)totals[key]=0;
+        getThreadRows().forEach(updateForumRow);
+        return publishForumStats(fromAutoFill);
     }
 
     function queueApplyForumDisplay() {
-        if (!pageInfo.isForumDisplay || state.forumApplyQueued) return;
+        if (!pageInfo.isForumDisplay || state.forumApplyQueued || state.suspended) return;
 
         state.forumApplyQueued = true;
         window.requestAnimationFrame(() => {
             state.forumApplyQueued = false;
+            if (state.suspended) return;
             applyForumDisplayFiltering(false);
         });
     }
@@ -1257,28 +1281,22 @@ a.syysj-page-jump {
         });
     }
 
+    function updatePostRow(postNode) {
+        const meta=readPostMeta(postNode); if(meta)indexRow(meta.uid,postNode);
+        setRowDisplay(postNode,meta?evaluateVisibility(meta,meta.isMaleGender).shouldHide:false);
+    }
     function applyViewThreadFiltering() {
-        if (!pageInfo.isViewThread) return;
-
-        const posts = getPostNodes();
-        posts.forEach((postNode) => {
-            const meta = readPostMeta(postNode);
-            if (!meta) {
-                postNode.style.display = '';
-                return;
-            }
-
-            const { shouldHide } = evaluateVisibility(meta, meta.isMaleGender);
-            postNode.style.display = shouldHide ? 'none' : '';
-        });
+        if(!pageInfo.isViewThread)return;
+        uidRows.clear(); getPostNodes().forEach(updatePostRow);
     }
 
     function queueApplyViewThread() {
-        if (!pageInfo.isViewThread || state.threadApplyQueued) return;
+        if (!pageInfo.isViewThread || state.threadApplyQueued || state.suspended) return;
 
         state.threadApplyQueued = true;
         window.requestAnimationFrame(() => {
             state.threadApplyQueued = false;
+            if (state.suspended) return;
             applyViewThreadFiltering();
         });
     }
@@ -1349,7 +1367,7 @@ a.syysj-page-jump {
         if (code === null) return;
 
         if (writeGenderCode(meta.uid, code)) {
-            queueApplyCurrentPage();
+            queueGenderRows(meta.uid);
         }
     }
 
@@ -1414,11 +1432,12 @@ a.syysj-page-jump {
     }
 
     function queueInstallUserControls() {
-        if (state.installUiQueued) return;
+        if (state.installUiQueued || state.suspended) return;
 
         state.installUiQueued = true;
         window.requestAnimationFrame(() => {
             state.installUiQueued = false;
+            if (state.suspended) return;
             installUserControls();
         });
     }
@@ -1427,11 +1446,21 @@ a.syysj-page-jump {
     // Observers
     // -----------------------------
 
+    const ownedObservers = new Set();
+    let observedTable=null, observedPosts=null;
     function observeForumDisplayThreadList() {
         if (!pageInfo.isForumDisplay) return;
 
         const threadTable = document.getElementById('threadlisttableid');
-        if (!threadTable || threadTable.__syysjObserverInstalled) return;
+        if (observedTable?.node === threadTable) return;
+        if(observedTable){
+            stopAutoFillSoon();
+            observedTable.observer.disconnect();ownedObservers.delete(observedTable.observer);
+            observedTable=null;
+            state.nextCursor=undefined;state.exhausted=false;state.tailPage=0;state.nextFillAt=0;
+            state.visitedPages.clear();state.loadedThreadKeys.clear();
+        }
+        if (!threadTable) return;
 
         const observer = new MutationObserver(() => {
             queueApplyForumDisplay();
@@ -1439,14 +1468,15 @@ a.syysj-page-jump {
         });
 
         observer.observe(threadTable, { childList: true, subtree: true });
-        threadTable.__syysjObserverInstalled = true;
+        observedTable={node:threadTable,observer}; ownedObservers.add(observer);
     }
 
     function observeViewThreadPostList() {
         if (!pageInfo.isViewThread) return;
 
         const postList = document.getElementById('postlist');
-        if (!postList || postList.__syysjObserverInstalled) return;
+        if (!postList || observedPosts?.node === postList) return;
+        if(observedPosts){observedPosts.observer.disconnect();ownedObservers.delete(observedPosts.observer);}
 
         const observer = new MutationObserver(() => {
             queueApplyViewThread();
@@ -1454,13 +1484,15 @@ a.syysj-page-jump {
         });
 
         observer.observe(postList, { childList: true, subtree: true });
-        postList.__syysjObserverInstalled = true;
+        observedPosts={node:postList,observer}; ownedObservers.add(observer);
     }
 
     function observeGlobalDynamicNodes() {
         if (state.globalObserverInstalled || !document.body) return;
 
         const observer = new MutationObserver((mutations) => {
+            if(document.getElementById('threadlisttableid') !== observedTable?.node && pageInfo.isForumDisplay) { observeForumDisplayThreadList(); queueApplyForumDisplay(); }
+            if(document.getElementById('postlist') !== observedPosts?.node && pageInfo.isViewThread) { observeViewThreadPostList(); queueApplyViewThread(); }
             let shouldInstall = false;
 
             for (const mutation of mutations) {
@@ -1486,10 +1518,12 @@ a.syysj-page-jump {
         });
 
         observer.observe(document.body, { childList: true, subtree: true });
-        state.globalObserverInstalled = true;
+        state.globalObserverInstalled = true; ownedObservers.add(observer);
     }
 
     function bootstrap() {
+        state.suspended=false; pageInfo=detectPage();
+        if(!pageInfo.supported)return;
         ensureStyle();
         ensureGlobalToggleHandler();
         observeGlobalDynamicNodes();
@@ -1512,6 +1546,21 @@ a.syysj-page-jump {
         queueInstallUserControls();
     }
 
+    if (typeof GM_addValueChangeListener === 'function') {
+        for(const key of [STORAGE_KEY_BLACKLIST,STORAGE_KEY_WHITELIST,STORAGE_KEY_FILTER_MALE]) GM_addValueChangeListener(key,(_key,_old,_next,remote)=>{
+            if(!remote)return; reloadLists(); state.filterMale=loadBoolean(STORAGE_KEY_FILTER_MALE,true);
+            if(!state.suspended)onUserListsChanged();
+        });
+    }
+    window.addEventListener('pagehide',()=>{
+        state.suspended=true; state.generation++; stopAutoFillSoon(); flushGenderMap();
+        for(const controller of state.genderControllers)controller.abort();
+        for(const timer of state.retryTimers)clearTimeout(timer); state.retryTimers.clear();
+        state.genderFetchQueue=[];state.genderHead=0;state.requestedGenderUids.clear();state.pendingGenderUids.clear();
+        for(const observer of ownedObservers)observer.disconnect(); ownedObservers.clear();
+        observedTable=observedPosts=null;state.globalObserverInstalled=false;
+        cancelAnimationFrame(genderFrame);genderFrame=null;dirtyUids.clear();uidRows.clear();rowOutcomes.clear();
+    });
     bootstrap();
     window.addEventListener('pageshow', bootstrap);
 })();

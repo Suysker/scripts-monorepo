@@ -3,7 +3,7 @@
 // @namespace    streamboost
 // @icon         https://image.suysker.xyz/i/2023/10/09/artworks-QOnSW1HR08BDMoe9-GJTeew-t500x500.webp
 // @namespace    http://tampermonkey.net/
-// @version      1.2.0
+// @version      1.3.0
 // @description  通用流媒体加速：加大缓冲、并发预取、内存命中、在途合并、按站点启停、修复部分站点自定义 Loader 导致的串行；当前覆盖 HLS.js，后续可扩展至其它播放器/协议。
 // @match        *://*/*
 // @run-at       document-start
@@ -33,6 +33,9 @@
     { value: 'fetch-xhr-hls', label: 'fetch-xhr-hls' }
   ]);
   const CONFIG_FIELDS = Object.freeze([
+    { group: '预取并发', type: 'number', key: 'prefetchSeconds', label: '预取前瞻秒数上限', def: 120, min: 5, max: 600, step: 5 },
+    { group: '请求策略+常规开关', type: 'bool', key: 'adaptivePrefetch', label: '实验性自适应预取（含省流量/直播策略）', def: false },
+    { group: '缓冲与内存', type: 'number', key: 'mseMemoryMb', label: 'MSE 缓冲目标（至少，MB）', def: DEFAULT_MAX_MEM_MB, min: 16, max: 512, step: 8 },
     { group: '预取并发', type: 'number', key: 'prefetchAhead', label: '预取前瞻片段数', def: 12, min: 0, max: 60, step: 1 },
     { group: '预取并发', type: 'number', key: 'maxConcurrentPrefetches', label: '页面总预取并发上限', def: 4, min: 1, max: 16, step: 1 },
     { group: '预取并发', type: 'number', key: 'maxConcurrentPrefetchesPerOrigin', label: '单资源 Origin 并发上限', def: 4, min: 1, max: 16, step: 1 },
@@ -40,7 +43,7 @@
     { group: '缓冲与内存', type: 'number', key: 'forwardBufferSeconds', label: 'HLS 前向目标（至少，秒）', def: DEFAULT_FORWARD_BUFFER_SEC, min: 60, max: 3600, step: 30 },
     { group: '缓冲与内存', type: 'number', key: 'backBufferSeconds', label: '回看目标（至少，秒）', def: 180, min: 0, max: 1800, step: 30 },
     { group: '缓冲与内存', type: 'number', key: 'maxBufferSeconds', label: '最大缓冲目标（至少，秒）', def: 1800, min: 120, max: 7200, step: 60 },
-    { group: '缓冲与内存', type: 'number', key: 'maxMemoryMb', label: 'LRU 上限 / MSE 目标（MB）', def: DEFAULT_MAX_MEM_MB, min: 16, max: 512, step: 8 },
+    { group: '缓冲与内存', type: 'number', key: 'maxMemoryMb', label: 'LRU 缓存上限（MB）', def: DEFAULT_MAX_MEM_MB, min: 16, max: 512, step: 8 },
     { group: '请求策略+常规开关', type: 'bool', key: 'prefetchEnabled', label: '并发预取', def: true },
     { group: '请求策略+常规开关', type: 'bool', key: 'memoryCacheEnabled', label: '内存命中 fLoader', def: true },
     { group: '请求策略+常规开关', type: 'number', key: 'prefetchTimeoutMs', label: '预取超时（ms）', def: 15000, min: 1000, max: 120000, step: 500 },
@@ -68,6 +71,7 @@
     return Object.fromEntries(CONFIG_FIELDS.map(field => [field.key, field.def]));
   }
   function normalizeRuntimeConfig(candidate) {
+    if (isRecord(candidate) && candidate.mseMemoryMb == null && candidate.maxMemoryMb != null) candidate = {...candidate, mseMemoryMb:candidate.maxMemoryMb};
     const source = isRecord(candidate) ? candidate : {};
     return Object.fromEntries(CONFIG_FIELDS.map(field => [field.key, normalizeFieldValue(source[field.key], field)]));
   }
@@ -376,7 +380,7 @@
   (function(RUNTIME_CONFIG){
     'use strict';
     const DEBUG = RUNTIME_CONFIG.debugEnabled === true;
-    const ACTIVE_MARKER = 'streamboost@1.2.0';
+    const ACTIVE_MARKER = 'streamboost@1.3.0';
     try {
       const firstActivation = window.__HLS_BIGBUF_ACTIVE__ !== ACTIVE_MARKER;
       window.__HLS_BIGBUF_ACTIVE__ = ACTIVE_MARKER;
@@ -422,7 +426,7 @@
     const MAX_MEM_MB = RUNTIME_CONFIG.maxMemoryMb;
     const MAX_MEM_BYTES = MAX_MEM_MB * 1024 * 1024;
     const MIN_MSE_BUFFER_BYTES = 60 * 1000 * 1000;
-    const MSE_BUFFER_BYTES = Math.max(MIN_MSE_BUFFER_BYTES, MAX_MEM_BYTES);
+    const MSE_BUFFER_BYTES = Math.max(MIN_MSE_BUFFER_BYTES, RUNTIME_CONFIG.mseMemoryMb * 1024 * 1024);
     const log  = (...a)=>{ if (DEBUG) console.log('[HLS BigBuffer]', ...a); };
     const warn = (...a)=>{ console.warn('[HLS BigBuffer]', ...a); };
     function enforceMinNumber(value, minimum) {
@@ -458,418 +462,334 @@
       if (ArrayBuffer.isView(buf))    return buf.byteLength || 0;
       return 0;
     }
-    const prebuf = new Map();
-    let prebufBytes = 0;
-    function lruGet(url){
-      const stored = prebuf.get(url);
-      if (!stored) return null;
-      if (isDetached(stored) || abSize(stored) === 0) { // 极少见：被外界转移/损坏
-        prebuf.delete(url);
-        return null;
+    // Per-player sessions own media identity; only budgets are shared by the page.
+    const sessions = new Set();
+    const prebuf = new Map(), inflightMap = new Map(), recentFailMap = new Map(), originSlots = new Map();
+    let prebufBytes = 0, sessionSequence = 0, pumping = false;
+    const metrics = { downloadedBytes: 0, usedBytes: 0, hits: 0, cancelled: 0 };
+    function deleteCache(key) {
+      const entry = prebuf.get(key);
+      if (entry) { prebufBytes -= entry.bytes; prebuf.delete(key); }
+    }
+    function lruGet(key) {
+      const entry = prebuf.get(key);
+      if (!entry) return null;
+      if (isDetached(entry.buffer) || !abSize(entry.buffer)) { deleteCache(key); return null; }
+      prebuf.delete(key); prebuf.set(key, entry);
+      if (!entry.used) { metrics.usedBytes += entry.bytes; entry.used = true; }
+      metrics.hits++;
+      return cloneAB(entry.buffer);
+    }
+    function lruSet(key, buffer, session) {
+      const bytes = abSize(buffer);
+      if (!ENABLE_MEMCACHE || !bytes || bytes > MAX_MEM_BYTES || session.disposed) return;
+      const copy = cloneAB(buffer);
+      if (!copy) return;
+      deleteCache(key);
+      prebuf.set(key, { buffer: copy, bytes, session, used: false }); prebufBytes += bytes;
+      while (prebufBytes > MAX_MEM_BYTES) deleteCache(prebuf.keys().next().value);
+    }
+    function fragmentRange(context) {
+      const frag = context.frag || context;
+      const start = context.rangeStart ?? frag.byteRangeStartOffset;
+      const end = context.rangeEnd ?? frag.byteRangeEndOffset;
+      if (start == null && end == null) return { start: null, end: null };
+      if (Number.isSafeInteger(start) && start >= 0 && Number.isSafeInteger(end) && end > start) return { start, end };
+      return null;
+    }
+    function resourceKey(session, context) {
+      if (context.part || context.resetIV || (context.headers && Object.keys(context.headers).length)) return null;
+      const range = fragmentRange(context);
+      if (!range || !context.url) return null;
+      return JSON.stringify([session.id, session.epoch, context.url, range.start, range.end]);
+    }
+    function sweepPenalties() {
+      const now = performance.now();
+      for (const [key, until] of recentFailMap) if (until <= now) recentFailMap.delete(key);
+      for (const [origin, until] of originBanUntil) if (until <= now) { originBanUntil.delete(origin); originFailCount.delete(origin); }
+      for (const map of [recentFailMap, originBanUntil, originFailCount]) {
+        while (map.size > 512) map.delete(map.keys().next().value);
       }
-      prebuf.delete(url); prebuf.set(url, stored);
-      return cloneAB(stored);
     }
-    function lruSet(url, buf){
-      const copy = cloneAB(buf);
-      const size = abSize(copy);
-      if (!size || size > MAX_MEM_BYTES) return;
-      if (prebuf.has(url)) {
-        prebufBytes -= (abSize(prebuf.get(url)) || 0);
-        prebuf.delete(url);
-      }
-      prebuf.set(url, copy);
-      prebufBytes += size;
-      while (prebufBytes > MAX_MEM_BYTES && prebuf.size) {
-        const [k, v] = prebuf.entries().next().value;
-        prebuf.delete(k); prebufBytes -= (abSize(v) || 0);
-      }
-    }
-    function lruHas(url){ return prebuf.has(url); }
-    const inflightMap  = new Map(); // url -> Promise<ArrayBuffer|null>
-    const inflightMeta = new Map(); // url -> { controller, level, sn, url, startedAt, origin }
-    const recentFailMap= new Map();
-    const floorSN      = new Map();
-    const originSlots  = new Map(); // origin -> n
-    function clearOriginPenalty(origin){
-      if (!origin) return;
-      originFailCount.delete(origin);
-      originBanUntil.delete(origin);
-    }
-    function clearUrlPenalty(url){
-      if (!url) return;
-      recentFailMap.delete(url);
-    }
-    function takeOriginSlot(origin) {
-      const cap = PREFETCH_CONC_PER_ORIGIN;
-      const n = originSlots.get(origin) || 0;
-      if (n >= cap) { if (DEBUG) log('slot denied', origin, n, '/', cap); return false; }
-      originSlots.set(origin, n + 1);
-      if (DEBUG) log('slot taken', origin, (n + 1), '/', cap, 'totalInflight=', inflightMap.size + 1);
-      return true;
-    }
-    function releaseOriginSlot(origin) {
-      const n = originSlots.get(origin) || 0;
-      if (n <= 1) originSlots.delete(origin); else originSlots.set(origin, n - 1);
-      if (DEBUG) log('slot released', origin, Math.max(0, n - 1));
+    function resetSession(session, dispose = false) {
+      session.epoch++; session.queue = []; session.index = null;
+      for (const entry of [...inflightMap.values()]) if (entry.session === session) entry.cancel();
+      for (const [key, entry] of prebuf) if (entry.session === session) deleteCache(key);
+      if (dispose) { session.disposed = true; sessions.delete(session); session.detach?.(); }
     }
     class CacheFirstFragLoader {
-      constructor(cfg){
-        const Hls = window.HlsOriginal || window.Hls || window.__HlsOriginal;
-        const BaseLoader = Hls?.DefaultConfig?.loader;
-        this.inner = BaseLoader ? new BaseLoader(cfg) : null;
-        this._resetStats();
+      constructor(cfg, session) {
+        this.session = session;
+        this.inner = new session.Loader(cfg);
+        this.stats = this.inner.stats || {};
+        this.generation = 0;
       }
-      _resetStats(){
-        const now = performance.now();
-        this.stats = {
-          aborted:false, loaded:0, total:0, retry:0, chunkCount:0, bwEstimate:0,
-          loading:{ start: now, first:0, end:0 },
-          parsing:{ start:0, end:0 },
-          buffering:{ start:0, first:0, end:0 },
-          trequest: now, tfirst:0, tload:0
+      load(context, config, callbacks) {
+        this.abort();
+        const generation = ++this.generation;
+        this.context = context;
+        this.stats.aborted = false;
+        let phase = 'waiting';
+        this.cancelLoad = () => {
+          if (phase === 'done') return;
+          phase = 'done';
+          callbacks.onAbort?.(this.stats, context, null);
         };
-      }
-      _markLoaded(byteLen){
-        const now = performance.now();
-        const s = this.stats;
-        s.loaded = byteLen|0; s.total = byteLen|0;
-        if (!s.loading.first) s.loading.first = now;
-        s.loading.end = now;
-        if (!s.tfirst) s.tfirst = now;
-        s.tload = now;
-      }
-      load(context, config, callbacks){
-        this.context = context; this.config = config; this.callbacks = callbacks;
-        this._resetStats();
-        try { context.loader = this; } catch {}
-        const url = context?.url;
-        const isFrag = (context?.type === 'fragment') || !!context?.frag;
-        const self = this;
-        function goInner(){
-          if (self.inner?.load) {
-            if (!self.inner.stats) self.inner.stats = self.stats;
-            return self.inner.load(context, config, callbacks);
-          }
-          if (url) {
-            const ctrl = Native.AC ? new Native.AC() : new AbortController();
-            const timer = setTimeout(()=>ctrl.abort(), config?.timeout || 20000);
-            (Native.Fetch || fetch)(url, { mode:'cors', credentials:'omit', signal: ctrl.signal })
-              .then(r => r.ok ? r.arrayBuffer() : Promise.reject(new Error('HTTP ' + r.status)))
-              .then(buf => {
-                const out = cloneAB(buf); // 交付副本，避免后续复用同一引用
-                if (!out || abSize(out) === 0) throw new Error('buffer-clone-empty');
-                self.stats.chunkCount += 1;
-                self._markLoaded(abSize(out));
-                if (ENABLE_MEMCACHE && isFrag) lruSet(url, buf);
-                callbacks.onSuccess({ url, data: out }, self.stats, context, null);
-              })
-              .catch(err => callbacks.onError?.({ code: 0, text: String(err) }, context, null))
-              .finally(()=> clearTimeout(timer));
-          }
-        }
-        if (isFrag && url) {
-          const hit = lruGet(url);
-          if (hit && abSize(hit) > 0) {
-            this.stats.chunkCount += 1;
-            this._markLoaded(abSize(hit));
-            if (typeof callbacks.onProgress === 'function') callbacks.onProgress(this.stats, context, hit, null);
-            callbacks.onSuccess({ url, data: hit }, this.stats, context, null);
-            if (DEBUG) log('fLoader cache hit', url, abSize(hit), 'bytes');
+        const valid = () => generation === this.generation && phase !== 'done';
+        const finish = (name, args) => {
+          if (!valid()) return;
+          phase = 'done'; clearTimeout(this.waitTimer);
+          if (this.inner.stats) this.stats = this.inner.stats;
+          callbacks[name]?.(...args);
+        };
+        const deliver = buffer => {
+          if (!valid() || phase !== 'waiting') return;
+          const now = performance.now();
+          Object.assign(this.stats, { aborted: false, loaded: buffer.byteLength, total: buffer.byteLength, retry: 0,
+            chunkCount: 1, bwEstimate: 0, loading: { start: now, first: now, end: now },
+            parsing: { start: 0, end: 0 }, buffering: { start: 0, first: 0, end: 0 },
+            trequest: now, tfirst: now, tload: now });
+          phase = 'done'; clearTimeout(this.waitTimer);
+          callbacks.onProgress?.(this.stats, context, cloneAB(buffer), null);
+          if (generation === this.generation) callbacks.onSuccess?.({url:context.url, data:buffer}, this.stats, context, null);
+        };
+        const key = resourceKey(this.session, context);
+        const goInner = () => {
+          if (!valid() || phase !== 'waiting') return;
+          phase = 'inner'; clearTimeout(this.waitTimer);
+          const guarded = { ...callbacks };
+          for (const name of ['onSuccess','onError','onTimeout','onAbort']) guarded[name] = (...args) => finish(name, args);
+          guarded.onProgress = (...args) => { if (valid()) callbacks.onProgress?.(...args); };
+          try { this.inner.load(context, config, guarded); this.stats = this.inner.stats || this.stats; }
+          catch (error) { finish('onError', [{code:0,text:String(error)},context,null]); }
+        };
+        if (key) {
+          const hit = lruGet(key);
+          if (hit) { deliver(hit); return; }
+          const pending = inflightMap.get(key);
+          if (pending) {
+            this.waitTimer = setTimeout(goInner, WAIT_INFLIGHT_MS);
+            pending.promise.then(buffer => {
+              if (!valid() || phase !== 'waiting') return;
+              const copy = buffer && lruGet(key);
+              if (copy) deliver(copy); else goInner();
+            }, goInner);
             return;
           }
         }
-        const p = (isFrag && url) ? inflightMap.get(url) : null;
-        if (p) {
-          let done = false;
-          const timer = setTimeout(() => { if (!done) goInner(); }, WAIT_INFLIGHT_MS);
-          p.then(buf => {
-            if (done) return;
-            clearTimeout(timer);
-            if (buf) {
-              const out = cloneAB(buf);
-              if (!out || abSize(out) === 0) { goInner(); return; }
-              this.stats.chunkCount += 1;
-              this._markLoaded(abSize(out));
-              if (ENABLE_MEMCACHE && isFrag) lruSet(url, buf);
-              callbacks.onSuccess({ url, data: out }, this.stats, context, null);
-              done = true;
-              if (DEBUG) log('fLoader merged in-flight prefetch', url, abSize(out), 'bytes');
-            } else {
-              goInner();
-            }
-          }).catch(() => { if (!done) { clearTimeout(timer); goInner(); }});
-          return;
-        }
         goInner();
       }
-      abort(ctx){ if (this.stats) this.stats.aborted = true; try { this.inner?.abort?.(ctx); } catch {} }
-      destroy(){ try { this.inner?.destroy?.(); } catch {} }
+      abort() {
+        this.generation++; clearTimeout(this.waitTimer);
+        if (this.stats) this.stats.aborted = true;
+        const cancel = this.cancelLoad; this.cancelLoad = null;
+        try { this.inner?.abort?.(); } catch {}
+        cancel?.();
+      }
+      destroy() { this.abort(); try { this.inner?.destroy?.(); } catch {} }
+      getCacheAge() { return this.inner?.getCacheAge?.() ?? null; }
+      getResponseHeader(name) { return this.inner?.getResponseHeader?.(name) ?? null; }
     }
-    function absUrlForFrag(details, frag){
-      let u = frag && (frag.url || frag.relurl);
-      if (!u) return '';
-      if (frag.url) return frag.url;
-      const base = (details && (details.baseurl || details.baseURI || details.baseuri)) || '';
-      try { return new URL(frag.relurl, base).href; } catch { return frag.relurl || ''; }
-    }
-    function abortStaleInflight(level, floor){
-      let aborted = 0;
-      inflightMeta.forEach((meta, url) => {
-        if (meta.level === level && typeof meta.sn === 'number' && meta.sn < floor) {
-          try { meta.controller && meta.controller.abort(); } catch {}
-          inflightMeta.delete(url);
-          inflightMap.delete(url);
-          aborted++;
-        }
-      });
-      if (aborted && DEBUG) log('abort stale inflight', 'level=', level, 'floor=', floor, 'aborted=', aborted);
-    }
-    function prefetchWithXHR(hls, details, nf, url, origin){
-      if (originBanUntil.get(origin) > performance.now()) { if (DEBUG) log('origin banned, skip XHR', origin); return null; }
-      if (!takeOriginSlot(origin)) return null;
-      const xhr = new Native.XHR();
-      let cleaned = false;
-      let timer = null;
-      const timeoutMs = (hls?.config?.fragLoadTimeout) || PREFETCH_TIMEOUT_MS;
-      const controller = { abort(){ try{ xhr.abort(); }catch{} } };
-      inflightMeta.set(url, { controller, level: nf.level, sn: nf.sn, url, startedAt: performance.now(), origin });
-      const p = new Promise((resolve) => {
+    // A transport always settles, even if an underlying abort emits no callback.
+    function runTransport(kind, entry) {
+      const { session, context } = entry;
+      return new Promise(resolve => {
+        let settled = false, handle, timer;
+        const done = result => {
+          if (settled) return;
+          settled = true; clearTimeout(timer);
+          entry.stopTransport = null;
+          if (kind === 'hls') { try { handle?.destroy?.(); } catch {} }
+          resolve(result);
+        };
+        entry.stopTransport = () => {
+          const current = handle;
+          done({ cancelled: true });
+          try { current?.abort?.(); } catch {}
+        };
+        timer = setTimeout(() => {
+          const current = handle;
+          done({ timeout: true });
+          try { current?.abort?.(); } catch {}
+        }, PREFETCH_TIMEOUT_MS);
+        const range = fragmentRange(context);
+        const statusResult = (status, buffer) => {
+          if (status >= 200 && status < 300 && buffer &&
+              (range.start === null || (status === 206 && buffer.byteLength === range.end - range.start))) done({ buffer });
+          else done({ status });
+        };
         try {
-          xhr.open('GET', url, true);
-          xhr.responseType = 'arraybuffer';
-          try { hls?.config?.xhrSetup && hls.config.xhrSetup(xhr, url); } catch {}
-          xhr.timeout = timeoutMs;
-          xhr.onload = function(){
-            releaseOriginSlot(origin);
-            cleanup();
-            const ok = (xhr.status >= 200 && xhr.status < 300);
-            if (!ok || !(xhr.response instanceof ArrayBuffer)) {
-              bumpFail(origin);
-              resolve(null);
-              return;
-            }
-            originFailCount.set(origin, 0);
-            const buf = xhr.response;
-            if (ENABLE_MEMCACHE) lruSet(url, buf);
-            if (DEBUG) log('prefetch XHR ok', url, abSize(buf), 'bytes');
-            resolve(buf); // 注意：消费者侧会 clone
-          };
-          xhr.onerror = function(){
-            releaseOriginSlot(origin);
-            cleanup(); bumpFail(origin); resolve(null);
-          };
-          xhr.ontimeout = function(){
-            releaseOriginSlot(origin);
-            cleanup(); bumpFail(origin); resolve(null);
-          };
-          xhr.onabort = function(){
-            releaseOriginSlot(origin);
-            cleanup(); resolve(null);
-          };
-          xhr.send();
-          timer = setTimeout(()=>{ try{ xhr.abort(); }catch{} }, timeoutMs + 500);
-        } catch {
-          releaseOriginSlot(origin);
-          cleanup(); resolve(null);
-        }
-        function cleanup(){
-          if (cleaned) return;
-          cleaned = true;
-          try{ xhr.onload = xhr.onerror = xhr.ontimeout = xhr.onabort = null; }catch{}
-          if (timer) { clearTimeout(timer); timer = null; }
-        }
-        function bumpFail(origin){
-          const fc = (originFailCount.get(origin) || 0) + 1;
-          originFailCount.set(origin, fc);
-          if (fc >= 2) originBanUntil.set(origin, performance.now() + ORIGIN_BAN_MS);
-        }
-      }).finally(()=>{ inflightMeta.delete(url); inflightMap.delete(url); });
-      inflightMap.set(url, p);
-      return p;
-    }
-    function prefetchWithHlsLoader(hls, details, nf, url, origin) {
-      const Hls = window.HlsOriginal || window.Hls || window.__HlsOriginal;
-      const BaseLoader = Hls?.DefaultConfig?.loader;
-      if (!BaseLoader) return null;
-      if (originBanUntil.get(origin) > performance.now()) { if (DEBUG) log('origin banned, skip HlsLoader', origin); return null; }
-      if (!takeOriginSlot(origin)) return null;
-      const loader = new BaseLoader(hls?.config || {});
-      const controller = { abort(){ try { loader.abort?.(); } catch {} } };
-      const ctx = { url, responseType:'arraybuffer', type:'fragment', frag:nf };
-      const timeoutMs = hls?.config?.fragLoadTimeout || PREFETCH_TIMEOUT_MS;
-      let timer = null;
-      const p = new Promise((resolve) => {
-        try {
-          loader.load(ctx, hls?.config || {}, {
-            onSuccess: (resp, stats, context) => {
-              releaseOriginSlot(origin);
-              clearTimeout(timer);
-              originFailCount.set(origin, 0);
-              const buf = resp && resp.data instanceof ArrayBuffer ? resp.data : null;
-              if (buf && ENABLE_MEMCACHE) lruSet(url, buf);
-              resolve(buf); // 消费侧 clone
-            },
-            onError: () => {
-              releaseOriginSlot(origin);
-              clearTimeout(timer);
-              const fc = (originFailCount.get(origin) || 0) + 1;
-              originFailCount.set(origin, fc);
-              if (fc >= 2) originBanUntil.set(origin, performance.now() + ORIGIN_BAN_MS);
-              resolve(null);
-            },
-            onTimeout: () => {
-              releaseOriginSlot(origin);
-              clearTimeout(timer);
-              const fc = (originFailCount.get(origin) || 0) + 1;
-              originFailCount.set(origin, fc);
-              if (fc >= 2) originBanUntil.set(origin, performance.now() + ORIGIN_BAN_MS);
-              resolve(null);
-            },
-            onProgress: ()=>{}
-          });
-          timer = setTimeout(()=>{ try{ loader.abort?.(); }catch{} }, timeoutMs);
-        } catch {
-          releaseOriginSlot(origin);
-          clearTimeout(timer);
-          resolve(null);
-        }
-      }).finally(()=>{ try{ loader.destroy?.(); }catch{}; inflightMeta.delete(url); inflightMap.delete(url); });
-      inflightMeta.set(url, { controller, level: nf.level, sn: nf.sn, url, startedAt: performance.now(), origin });
-      inflightMap.set(url, p);
-      return p;
-    }
-    function prefetchWithFetch(details, nf, url, origin){
-      if (originBanUntil.get(origin) > performance.now()) { if (DEBUG) log('origin banned, skip fetch', origin); return null; }
-      if (!takeOriginSlot(origin)) return null;
-      const controller = Native.AC ? new Native.AC() : new AbortController();
-      const opts = { mode:'cors', credentials:'omit', signal: controller.signal };
-      const timeout = setTimeout(()=> controller.abort(), PREFETCH_TIMEOUT_MS);
-      const p = (Native.Fetch || fetch)(url, opts)
-        .then(r => r.ok ? r.arrayBuffer() : null)
-        .then(buf => {
-          releaseOriginSlot(origin);
-          if (buf) {
-            originFailCount.set(origin, 0);
-            if (ENABLE_MEMCACHE) lruSet(url, buf);
-            if (DEBUG) log('prefetch fetch ok', url, abSize(buf), 'bytes');
+          if (kind === 'hls') {
+            handle = new session.Loader(session.hls.config);
+            const policy = session.hls.config.fragLoadPolicy?.default;
+            const loaderConfig = { timeout:PREFETCH_TIMEOUT_MS,maxRetry:0,retryDelay:0,maxRetryDelay:0,
+              ...(policy ? {loadPolicy:{...policy,maxTimeToFirstByteMs:PREFETCH_TIMEOUT_MS,maxLoadTimeMs:PREFETCH_TIMEOUT_MS,timeoutRetry:null,errorRetry:null}} : {}) };
+            handle.load(context, loaderConfig, {
+              onSuccess: (response, stats, ctx, network) => {
+                const buffer = response?.data;
+                // The original loader owns range/auth semantics on this path.
+                if (buffer instanceof ArrayBuffer && (range.start === null || buffer.byteLength === range.end - range.start)) done({buffer});
+                else done({status:network?.status || 0});
+              },
+              onError: error => done({status:Number(error?.code) || 0}),
+              onTimeout: () => done({timeout:true}), onAbort: () => done({cancelled:true}), onProgress() {}
+            });
+          } else if (kind === 'xhr') {
+            handle = new Native.XHR();
+            handle.open('GET', context.url, true); handle.responseType = 'arraybuffer';
+            handle.onload = () => statusResult(handle.status, handle.response);
+            handle.onerror = () => done({status:handle.status});
+            handle.onabort = () => done({cancelled:true});
+            handle.ontimeout = () => done({timeout:true});
+            handle.timeout = PREFETCH_TIMEOUT_MS;
+            Promise.resolve(session.hls.config.xhrSetup?.(handle, context.url)).then(() => {
+              if (settled) return;
+              if (range.start !== null) handle.setRequestHeader('Range', 'bytes=' + range.start + '-' + (range.end - 1));
+              handle.send();
+            }).catch(() => done({status:0}));
           } else {
-            const fc = (originFailCount.get(origin) || 0) + 1;
-            originFailCount.set(origin, fc);
-            if (fc >= 2) originBanUntil.set(origin, performance.now() + ORIGIN_BAN_MS);
+            handle = new (Native.AC || AbortController)();
+            const headers = range.start === null ? {} : {Range:'bytes=' + range.start + '-' + (range.end - 1)};
+            (Native.Fetch || fetch)(context.url, {mode:'cors',credentials:'same-origin',headers,signal:handle.signal})
+              .then(async response => statusResult(response.status, response.ok ? await response.arrayBuffer() : null))
+              .catch(() => done({status:0}));
           }
-          return buf; // 消费侧 clone
-        })
-        .catch(() => {
-          releaseOriginSlot(origin);
-          const fc = (originFailCount.get(origin) || 0) + 1;
-          originFailCount.set(origin, fc);
-          if (fc >= 2) originBanUntil.set(origin, performance.now() + ORIGIN_BAN_MS);
-          return null;
-        })
-        .finally(() => { clearTimeout(timeout); inflightMeta.delete(url); inflightMap.delete(url); });
-      inflightMap.set(url, p);
-      inflightMeta.set(url, { controller, level: nf.level, sn: nf.sn, url, startedAt: performance.now(), origin });
-      return p;
+        } catch { done({status:0}); }
+      });
     }
-    (function setupPrefetcher(){
-      if (!ENABLE_PREFETCH) return;
-      function prefetchFrag(hls, details, nf){
-        const url = absUrlForFrag(details, nf);
-        if (!url) return null;
-        const origin = (()=>{ try { return new URL(url).origin; } catch { return ''; } })();
-        if (lruHas(url)) { if (DEBUG) log('prefetch skip: LRU has', url); return inflightMap.get(url) || null; }
-        if (inflightMap.has(url)) return inflightMap.get(url);
-        const lastFail = recentFailMap.get(url);
-        if (lastFail && (performance.now() - lastFail < FAIL_TTL_MS)) {
-          if (DEBUG) log('prefetch skip: recent fail', url);
-          return null;
-        }
-        if (inflightMap.size >= PREFETCH_CONC_GLOBAL) return null;
-        const chain =
-          PREFETCH_STRATEGY === 'hls-xhr-fetch' ? [
-            () => prefetchWithHlsLoader(hls, details, nf, url, origin),
-            () => prefetchWithXHR(hls, details, nf, url, origin),
-            () => prefetchWithFetch(details, nf, url, origin)
-          ] :
-          PREFETCH_STRATEGY === 'hls-only' ? [
-            () => prefetchWithHlsLoader(hls, details, nf, url, origin)
-          ] :
-          PREFETCH_STRATEGY === 'xhr-only' ? [
-            () => prefetchWithXHR(hls, details, nf, url, origin)
-          ] :
-          PREFETCH_STRATEGY === 'fetch-only' ? [
-            () => prefetchWithFetch(details, nf, url, origin)
-          ] :
-          PREFETCH_STRATEGY === 'fetch-xhr-hls' ? [
-            () => prefetchWithFetch(details, nf, url, origin),
-            () => prefetchWithXHR(hls, details, nf, url, origin),
-            () => prefetchWithHlsLoader(hls, details, nf, url, origin)
-          ] : [
-            () => prefetchWithXHR(hls, details, nf, url, origin),
-            () => prefetchWithHlsLoader(hls, details, nf, url, origin),
-            () => prefetchWithFetch(details, nf, url, origin)
-          ];
-        let p = null;
-        for (const fn of chain) {
-          p = fn();
-          if (p) break;
-        }
-        p?.then(buf => { if (!buf) recentFailMap.set(url, performance.now()); })
-          .finally(()=>{ inflightMeta.delete(url); inflightMap.delete(url); });
-        return p;
-      }
-      function attach(hls){
-        const Ev = hls.constructor?.Events || {};
-        function scheduleAheadFromFrag(frag){
-          try {
-            if (!frag) return;
-            const t = frag.type || 'video';
-            if (t !== 'main' && t !== 'video') return;
-            const level = frag.level;
-            const S = frag.sn;
-            floorSN.set(level, S);
-            abortStaleInflight(level, S);
-            const details = hls.levels && hls.levels[level] && hls.levels[level].details;
-            if (!details || !Array.isArray(details.fragments)) return;
-            let idx = details.fragments.findIndex(f => f.sn === S);
-            if (idx < 0) {
-              idx = 0;
-              for (let i = 0; i < details.fragments.length; i++) {
-                if ((details.fragments[i].sn|0) >= (S|0)) { idx = i; break; }
-              }
+    function startPrefetch(session, context) {
+      const key = resourceKey(session, context), origin = new URL(context.url, location.href).origin;
+      if (!key || inflightMap.has(key) || prebuf.has(key)) return;
+      const entry = { session, context, key, origin, epoch:session.epoch, cancelled:false, stopTransport:null };
+      let resolve;
+      entry.promise = new Promise(r => { resolve = r; });
+      entry.cancel = () => { entry.cancelled = true; entry.stopTransport?.(); };
+      inflightMap.set(key, entry);
+      originSlots.set(origin, (originSlots.get(origin) || 0) + 1);
+      const started = performance.now();
+      (async () => {
+        let result = null;
+        try {
+          // Unknown custom/auth setup must keep the original transport contract.
+          const config = session.hls.config;
+          const originalOnly = session.custom || config.fetchSetup || config.xhrSetup;
+          const chain = originalOnly ? ['hls'] : PREFETCH_STRATEGY.replace('-only','').split('-');
+          for (const kind of chain) {
+            if (entry.cancelled || entry.epoch !== session.epoch || session.disposed) break;
+            const response = await runTransport(kind, entry);
+            if (response.buffer) { result = response.buffer; break; }
+            if (response.cancelled || [401,403,404,429].includes(response.status)) break;
+          }
+          if (!entry.cancelled && entry.epoch === session.epoch && !session.disposed) {
+            if (result) {
+              metrics.downloadedBytes += result.byteLength;
+              lruSet(key, result, session);
+              originFailCount.delete(origin); originBanUntil.delete(origin);
+              session.estimate = session.estimate * 0.75 + result.byteLength * 0.25;
+            } else {
+              recentFailMap.set(key, performance.now() + FAIL_TTL_MS);
+              const count = (originFailCount.get(origin) || 0) + 1;
+              originFailCount.set(origin, count);
+              if (count >= 2) originBanUntil.set(origin, performance.now() + ORIGIN_BAN_MS);
             }
-            for (let k = 1; k <= PREFETCH_AHEAD; k++) {
-              const nf = details.fragments[idx + k];
-              if (!nf) break;
-              const floor = floorSN.get(nf.level ?? level) ?? S;
-              if (typeof nf.sn === 'number' && nf.sn < floor) continue;
-              prefetchFrag(hls, details, nf);
+            if (RUNTIME_CONFIG.adaptivePrefetch) {
+              const slow = !result || performance.now() - started > (context.frag.duration || 5) * 1000;
+              session.badSamples = slow ? session.badSamples + 1 : 0;
+              session.goodSamples = slow ? 0 : session.goodSamples + 1;
+              if (session.badSamples >= 2) { session.limit = Math.max(1,session.limit - 1); session.badSamples = 0; }
+              if (session.goodSamples >= 8) { session.limit = Math.min(PREFETCH_CONC_GLOBAL,session.limit + 1); session.goodSamples = 0; }
             }
-          } catch (e) { if (DEBUG) log('scheduleAheadFromFrag error', e); }
+          } else { result = null; metrics.cancelled++; }
+        } catch { result = null; }
+        finally {
+          if (inflightMap.get(key) === entry) inflightMap.delete(key);
+          const slots = (originSlots.get(origin) || 1) - 1;
+          if (slots) originSlots.set(origin,slots); else originSlots.delete(origin);
+          resolve(result); sweepPenalties(); queueMicrotask(pumpPrefetch);
         }
-        hls.on(Ev.FRAG_LOADING, (_evt, data) => { scheduleAheadFromFrag(data && data.frag); });
-        hls.on(Ev.FRAG_LOADED,  (_evt, data) => {
-          const frag = data && data.frag;
-          scheduleAheadFromFrag(frag);
-          try {
-            const url = frag && (frag.url || frag._url);
-            if (url) {
-              clearUrlPenalty(url);
-              const origin = new URL(url, location.href).origin;
-              clearOriginPenalty(origin);
-            }
-          } catch {}
-        });
-        log('prefetcher attached (XHR→HlsLoader→fetch; ahead=', PREFETCH_AHEAD, ', global=', PREFETCH_CONC_GLOBAL, ', perOrigin=', PREFETCH_CONC_PER_ORIGIN, ', wait=', WAIT_INFLIGHT_MS, 'ms)');
-      }
-      window.__HLS_BIGBUF_ATTACH_PREFETCH__ = attach;
-    })();
-    function isCtor(v){ return typeof v === 'function'; }
-    function protectGlobal(name, value){
-      try { delete window[name]; } catch {}
-      Object.defineProperty(window, name, { value, writable:false, configurable:true, enumerable:false });
+      })();
     }
+    function pumpPrefetch() {
+      if (pumping) return;
+      pumping = true;
+      try {
+        let progress = true;
+        while (progress && inflightMap.size < PREFETCH_CONC_GLOBAL) {
+          progress = false;
+          for (const session of sessions) {
+            if (session.disposed || !session.queue.length || inflightMap.size >= PREFETCH_CONC_GLOBAL) continue;
+            if (RUNTIME_CONFIG.adaptivePrefetch && navigator.connection?.saveData) continue;
+            const active = [...inflightMap.values()].filter(e => e.session === session).length;
+            if (active >= session.limit) continue;
+            // Estimate only; downloaded responses and MSE are additional memory.
+            const reserved = [...inflightMap.values()].reduce((n,e) => n + e.session.estimate,0);
+            if (reserved + session.estimate > MAX_MEM_BYTES) continue;
+            const index = session.queue.findIndex(context => {
+              const origin = new URL(context.url, location.href).origin;
+              return (originSlots.get(origin) || 0) < PREFETCH_CONC_PER_ORIGIN && !(originBanUntil.get(origin) > performance.now());
+            });
+            if (index < 0) continue;
+            const context = session.queue.splice(index,1)[0], key = resourceKey(session,context);
+            progress = true;
+            if (!key || prebuf.has(key) || inflightMap.has(key) || recentFailMap.get(key) > performance.now()) continue;
+            startPrefetch(session,context);
+          }
+        }
+      } finally { pumping = false; }
+    }
+    function attachPrefetch(hls, session, Ev) {
+      sessions.add(session); session.hls = hls;
+      const listeners = [];
+      const on = (event, fn) => { if (event) { hls.on(event,fn); listeners.push([event,fn]); } };
+      let media;
+      const seeking = () => resetSession(session);
+      const bindMedia = () => {
+        media?.removeEventListener('seeking',seeking); media = hls.media;
+        media?.addEventListener('seeking',seeking);
+      };
+      on(Ev.MEDIA_ATTACHED,bindMedia); bindMedia();
+      on(Ev.MEDIA_DETACHING,() => { media?.removeEventListener('seeking',seeking); media=null; resetSession(session); });
+      on(Ev.MANIFEST_LOADING,() => resetSession(session));
+      on(Ev.LEVEL_SWITCHING,() => resetSession(session));
+      on(Ev.DESTROYING,() => resetSession(session,true));
+      session.detach = () => { media?.removeEventListener('seeking',seeking); for (const [event,fn] of listeners) hls.off?.(event,fn); };
+      const schedule = (_event,data) => {
+        const frag = data?.frag;
+        if (!frag || !['main','video'].includes(frag.type || 'main')) return;
+        const details = hls.levels?.[frag.level]?.details;
+        if (!Array.isArray(details?.fragments)) return;
+        const fragments = details.fragments;
+        if (!session.index || session.index.details !== details || session.index.fragments !== fragments || session.index.length !== fragments.length || session.index.first !== fragments[0]?.sn || session.index.last !== fragments.at(-1)?.sn) {
+          session.index = { details,fragments,length:fragments.length,first:fragments[0]?.sn,last:fragments.at(-1)?.sn,map:new Map(fragments.map((f,i)=>[f.sn,i])) };
+        }
+        const index = session.index.map.get(frag.sn);
+        if (index === undefined) return;
+        for (const entry of inflightMap.values()) if (entry.session === session && entry.context.frag.level === frag.level && entry.context.frag.sn < frag.sn) entry.cancel();
+        session.queue = [];
+        if (!ENABLE_PREFETCH || !ENABLE_MEMCACHE) return;
+        let seconds = 0;
+        const horizon = RUNTIME_CONFIG.adaptivePrefetch && details.live ? Math.min(12,RUNTIME_CONFIG.prefetchSeconds) : RUNTIME_CONFIG.prefetchSeconds;
+        for (const nf of fragments.slice(index+1,index+1+PREFETCH_AHEAD)) {
+          if (nf.gap) continue;
+          if (seconds >= horizon) break;
+          seconds += Number(nf.duration) || 0;
+          let url;
+          try { url = nf.url || new URL(nf.relurl, details.baseurl || location.href).href; } catch { continue; }
+          const range = fragmentRange(nf);
+          if (!range) continue;
+          const context = {url,responseType:'arraybuffer',type:'fragment',frag:nf,part:null};
+          if (range.start !== null) { context.rangeStart=range.start; context.rangeEnd=range.end; }
+          session.queue.push(context);
+        }
+        pumpPrefetch();
+      };
+      on(Ev.FRAG_LOADING,schedule); on(Ev.FRAG_LOADED,schedule);
+    }
+    window.addEventListener('pagehide', () => { for (const session of sessions) resetSession(session); });
+    if (DEBUG) window.__STREAMBOOST_DIAGNOSTICS__ = () => ({...metrics,cacheBytes:prebufBytes,activeRequests:inflightMap.size,sessions:sessions.size});
+
+    function isCtor(v){ return typeof v === 'function' && !!v.DefaultConfig && !!v.Events; }
+    const patchedConstructors = new WeakMap();
     const adapters = [];
     function registerAdapter(adapter){
       if (!adapter || typeof adapter.install !== 'function') return;
@@ -884,7 +804,7 @@
     function patchHlsClass(OriginalHls){
       try{
         if(!OriginalHls || OriginalHls.__HLS_BIGBUF_PATCHED__ || !isCtor(OriginalHls)) return OriginalHls;
-        window.HlsOriginal = window.__HlsOriginal = OriginalHls;
+        if (patchedConstructors.has(OriginalHls)) return patchedConstructors.get(OriginalHls);
         try {
           if (OriginalHls.DefaultConfig) Object.assign(OriginalHls.DefaultConfig, buildHlsBufferConfig(OriginalHls.DefaultConfig));
           log('DefaultConfig applied', OriginalHls.DefaultConfig);
@@ -893,22 +813,15 @@
           constructor(userConfig = {}){
             if (!userConfig || typeof userConfig !== 'object') userConfig = {};
             const enforced = Object.assign({}, userConfig, buildHlsBufferConfig(userConfig));
-            if (ENABLE_MEMCACHE) {
-              const UserLoader = userConfig.fLoader || userConfig.loader;
-              if (UserLoader) {
-                class CustomFragLoader extends CacheFirstFragLoader {
-                  constructor(cfg) {
-                    super(cfg);
-                    try { this.inner = new UserLoader(cfg); } catch(e) { log('CustomFragLoader init failed', e); }
-                  }
-                }
-                enforced.fLoader = CustomFragLoader;
-                log('Wrapped custom loader for compatibility', UserLoader);
-              } else {
-                enforced.fLoader = CacheFirstFragLoader;
-              }
+            const Loader = userConfig.fLoader || userConfig.loader || OriginalHls.DefaultConfig.loader;
+            const session = {id:++sessionSequence,epoch:0,Loader,custom:!!(userConfig.fLoader || userConfig.loader),
+              disposed:false,queue:[],index:null,estimate:2*1024*1024,limit:PREFETCH_CONC_GLOBAL,badSamples:0,goodSamples:0};
+            if (ENABLE_MEMCACHE && typeof Loader === 'function') {
+              enforced.fLoader = class extends CacheFirstFragLoader { constructor(cfg) { super(cfg,session); } };
             }
             super(enforced);
+            this.__streamboostSession = session;
+            attachPrefetch(this,session,OriginalHls.Events);
             window.__HLS_BIGBUF_LAST__ = this;
             try {
               this.on(OriginalHls.Events.LEVEL_LOADED, (_evt, data) => {
@@ -928,12 +841,13 @@
                 }
               });
             } catch {}
-            try {
-              if (ENABLE_PREFETCH && typeof window.__HLS_BIGBUF_ATTACH_PREFETCH__ === 'function') {
-                window.__HLS_BIGBUF_ATTACH_PREFETCH__(this);
-              }
-            } catch {}
-            log('Hls instance created with config', this.config, 'prefetch=', ENABLE_PREFETCH, 'memcache=', ENABLE_MEMCACHE);
+
+            log('Hls instance created', {prefetch:ENABLE_PREFETCH,memcache:ENABLE_MEMCACHE});
+          }
+          destroy() {
+            resetSession(this.__streamboostSession,true);
+            if (window.__HLS_BIGBUF_LAST__ === this) window.__HLS_BIGBUF_LAST__ = null;
+            return super.destroy();
           }
         }
         Object.getOwnPropertyNames(OriginalHls).forEach((name)=>{
@@ -946,6 +860,7 @@
         });
         Object.defineProperty(PatchedHls, '__HLS_BIGBUF_PATCHED__', { value: true });
         log('PatchedHls ready. version=', OriginalHls.version, 'events=', OriginalHls.Events);
+        patchedConstructors.set(OriginalHls,PatchedHls);
         return PatchedHls;
       }catch(e){
         warn('patchHlsClass failed', e);
@@ -953,44 +868,17 @@
       }
     }
     function armSetterOnce(){
-      if ('Hls' in window && isCtor(window.Hls)) {
-        const Patched = patchHlsClass(window.Hls);
-        protectGlobal('Hls', Patched);
-        log('Patched existing window.Hls immediately');
+      const descriptor = Object.getOwnPropertyDescriptor(window,'Hls');
+      if (descriptor && (!descriptor.configurable || descriptor.writable === false || descriptor.get || descriptor.set)) {
+        if (descriptor.writable && isCtor(window.Hls)) window.Hls = patchHlsClass(window.Hls);
         return;
       }
-      let armed = true;
-      Object.defineProperty(window, 'Hls', {
-        configurable: true,
-        enumerable: false,
-        get(){ return undefined; },
-        set(v){
-          if(!armed) return;
-          armed = false;
-          if (!isCtor(v)) { log('window.Hls set but not a constructor, skip patch'); protectGlobal('Hls', v); return; }
-          const Patched = patchHlsClass(v);
-          protectGlobal('Hls', Patched);
-          log('Intercepted and replaced window.Hls');
-        }
+      let value = window.Hls;
+      if (isCtor(value)) value = patchHlsClass(value);
+      Object.defineProperty(window,'Hls',{
+        configurable:true,enumerable:descriptor?.enumerable ?? true,
+        get:()=>value,set:next=>{ value=isCtor(next)?patchHlsClass(next):next; }
       });
-      if (window === window.top) log('Setter hook armed (page/iframe context, waiting for window.Hls)');
-      if (window === window.top) setTimeout(()=>{
-        if(!window.Hls || (window.Hls && !window.Hls.__HLS_BIGBUF_PATCHED__)){
-          const hints = {
-            hasVideoJS: !!window.videojs,
-            hasDashJS: !!(window.dashjs || window.MediaPlayer),
-            nativeHLS: (function(){
-              try{
-                const v=document.createElement('video');
-                const t1=v.canPlayType('application/vnd.apple.mpegurl');
-                const t2=v.canPlayType('application/x-mpegURL');
-                return (t1==='probably'||t1==='maybe'||t2==='probably'||t2==='maybe');
-              }catch{ return false; }
-            })()
-          };
-          console.warn('[HLS BigBuffer] 顶层未检测到 Hls（播放器在跨域 iframe 内时属于正常情况；若已看到 iframe 的“已激活”提示可忽略）。诊断：', hints);
-        }
-      }, 8000);
     }
     registerAdapter({ name: 'hls', install: armSetterOnce });
     runAdapters();

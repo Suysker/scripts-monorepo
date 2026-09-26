@@ -2,7 +2,7 @@
 
 > **按住"→"键倍速播放，按住"←"键减速播放，松开恢复原来的倍速，轻松追剧，看视频更灵活，还能快进/跳过大部分网站的广告！**
 
-![License](https://img.shields.io/github/license/Suysker/scripts-monorepo?style=flat-square) ![Downloads](https://img.shields.io/greasyfork/dt/507274?style=flat-square) ![Version](https://img.shields.io/greasyfork/v/507274?style=flat-square) ![Tampermonkey](https://img.shields.io/badge/Tampermonkey-5.1.1-red.svg?style=popout-square) ![Tampermonkey](https://img.shields.io/badge/Tampermonkey-Beta-red.svg?style=popout-square)
+![License](https://img.shields.io/github/license/Suysker/scripts-monorepo?style=flat-square) ![Downloads](https://img.shields.io/greasyfork/dt/507274?style=flat-square) ![Tampermonkey](https://img.shields.io/badge/Tampermonkey-Supported-red?style=flat-square)
 
 ------
 
@@ -18,7 +18,7 @@
 
 - **倍速播放**：按住右键（→）时，视频将以用户设定的倍速播放，松开后恢复原来的播放速度。默认2倍速，适合快速浏览视频内容。
 - **减速播放**：按住左键（←）时，视频以减速播放，速度为设定的倍速的倒数。适合需要慢放细节的场景，松开后恢复原速。
-- **快进/回退**：松开右键时，视频会自动快进设定的秒数（默认5秒）。
+- **快进/回退**：短按右键或左键后松开，视频会快进或回退设定的秒数（默认5秒）；长按松键仅恢复原速。
 - **同步快进**：**同时按下左右键（← + →）** 时，视频将快速快进设定的秒数（默认180秒），帮助跳过长片段或广告。
 - **域名启用/禁用控制**：通过菜单轻松控制脚本在特定网站上的启用或禁用，用户可以根据需要决定在哪些网站应用该功能。
 - **Web Component 播放器支持**：自动识别普通 DOM 与 open Shadow DOM 内的视频元素，兼容斗鱼视频等将播放器封装在 Web Component 中的页面。
@@ -66,7 +66,7 @@
 
 1. 打开任意含视频页面，进入 Tampermonkey 菜单，点击 `⚙️ 打开参数配置页`。
 2. 修改任一参数并保存。
-3. 按键验证：右键连按触发倍速、松开触发跳转，左右同按触发组合快进。
+3. 按键验证：短按左右键松开后跳转，长按触发临时倍速并在松开后恢复，左右同按触发组合快进。
 4. Shadow DOM 验证：打开斗鱼视频页（如 `https://v.douyu.com/show/r90XWgRB3xNMgk25?ap=1`），确认 `→` / `←` 对 Web Component 内的视频同样生效。
 
 ------
@@ -81,12 +81,16 @@
 
 ## 🧩 资源优化
 
+短按左右键跳转时保持当前倍速。每次手势绑定开始时的视频，临时倍速在松键、进入输入框、失焦、禁用或视频移除时收尾；如果站点或用户已经另行修改倍速，脚本不覆盖新值。长按仍沿用键盘重复事件触发；短按松键跳转，长按松键仅恢复原速，组合键每个手势只跳转一次。
+
+视频与 open Shadow DOM 采用新增子树扫描，页面可见时每 15 秒校验一次，用于发现后来挂载的 ShadowRoot。停用会停止观察和扫描。根域名规则兼容已保存的禁用数据，IP 与 localhost 单独识别；离线后缀规则并非完整公共后缀数据库，未知后缀按当前主机名处理。
+
 - **按键热路径缓存化**：左右键操作优先从视频注册表读取当前视频，只有注册表失效时才刷新 DOM / open Shadow DOM。
-- **MutationObserver 批处理**：页面变化只标记注册表失效，并合并为一次延迟刷新，避免高频弹幕或评论更新造成同步扫描。
+- **MutationObserver 批处理**：新增子树合并扫描，移除时清理断开的候选，避免每次弹幕或评论更新都扫描全页。
 - **弱引用初始化记录**：使用 `WeakSet` 记录已绑定播放监听的视频，移除的视频不会因脚本缓存而被长期强引用。
 - **观察根重建**：定期从当前 live DOM 重建 document / open shadow root 观察范围，降低 detached Shadow DOM 滞留风险。
-- **线性视频选择**：最大可见视频选择使用单次线性扫描，不再排序候选数组。
-- **键盘监听合并**：方向键监听器从 4 个合并为 2 个，保留原有状态机行为。
+- **线性视频选择**：最大可见视频选择使用单次线性扫描。
+- **键盘监听合并**：使用统一的按下和松开监听器管理方向键手势。
 
 ------
 
