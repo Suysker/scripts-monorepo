@@ -3,7 +3,7 @@
 // @namespace    streamboost
 // @icon         https://image.suysker.xyz/i/2023/10/09/artworks-QOnSW1HR08BDMoe9-GJTeew-t500x500.webp
 // @namespace    http://tampermonkey.net/
-// @version      1.4.0
+// @version      1.5.0
 // @description  通用流媒体加速：加大缓冲、并发预取、内存命中、在途合并、按站点启停、修复部分站点自定义 Loader 导致的串行；当前覆盖 HLS.js，后续可扩展至其它播放器/协议。
 // @match        *://*/*
 // @run-at       document-start
@@ -17,12 +17,11 @@
 (() => {
   'use strict';
   const SETTINGS_STORAGE_KEY = 'streamboost.settings';
-  const SETTINGS_SCHEMA_VERSION = 1;
+  const SETTINGS_SCHEMA_VERSION = 2;
   const DEFAULT_DEVICE_MEMORY_GB = 4;
   const deviceMemoryGb = Number.isFinite(Number(navigator.deviceMemory))
     ? Number(navigator.deviceMemory)
     : DEFAULT_DEVICE_MEMORY_GB;
-  const DEFAULT_FORWARD_BUFFER_SEC = deviceMemoryGb < 4 ? 180 : 600;
   const DEFAULT_MAX_MEM_MB = deviceMemoryGb >= 8 ? 192 : (deviceMemoryGb >= 4 ? 128 : 64);
   const PREFETCH_STRATEGIES = Object.freeze([
     { value: 'xhr-hls-fetch', label: 'xhr-hls-fetch（推荐）' },
@@ -33,22 +32,23 @@
     { value: 'fetch-xhr-hls', label: 'fetch-xhr-hls' }
   ]);
   const CONFIG_FIELDS = Object.freeze([
-    { group: '预取并发', type: 'number', key: 'prefetchSeconds', label: '预取目标（秒）', def: 120, min: 5, max: 7200, step: 5 },
+    { group: '预取并发', type: 'number', key: 'prefetchSeconds', label: '预取目标（秒）', def: 600, min: 5, max: 7200, step: 5 },
     { group: '请求策略+常规开关', type: 'bool', key: 'adaptivePrefetch', label: '实验性自适应预取（含省流量/直播策略）', def: false },
     { group: '缓冲与内存', type: 'number', key: 'mseMemoryMb', label: 'MSE 缓冲目标（至少，MB）', def: DEFAULT_MAX_MEM_MB, min: 16, max: 512, step: 8 },
     { group: '预取并发', type: 'number', key: 'prefetchAhead', label: '每批预取片段数（0 为关闭）', def: 12, min: 0, max: 60, step: 1 },
     { group: '预取并发', type: 'number', key: 'maxConcurrentPrefetches', label: '页面总预取并发上限', def: 4, min: 1, max: 16, step: 1 },
     { group: '预取并发', type: 'number', key: 'maxConcurrentPrefetchesPerOrigin', label: '单资源 Origin 并发上限', def: 4, min: 1, max: 16, step: 1 },
     { group: '预取并发', type: 'number', key: 'inflightReuseWaitMs', label: '在途复用等待（ms）', def: 500, min: 0, max: 10000, step: 50 },
-    { group: '缓冲与内存', type: 'number', key: 'forwardBufferSeconds', label: '前向目标（秒）', def: DEFAULT_FORWARD_BUFFER_SEC, min: 60, max: 3600, step: 30 },
+    { group: '缓冲与内存', type: 'number', key: 'forwardBufferSeconds', label: '前向目标（秒）', def: 600, min: 5, max: 7200, step: 5 },
     { group: '缓冲与内存', type: 'number', key: 'backBufferSeconds', label: '回看目标（至少，秒）', def: 180, min: 0, max: 1800, step: 30 },
-    { group: '缓冲与内存', type: 'number', key: 'maxBufferSeconds', label: '最大缓冲目标（秒）', def: 1800, min: 120, max: 7200, step: 60 },
-    { group: '缓冲与内存', type: 'number', key: 'maxMemoryMb', label: 'LRU 缓存上限（MB）', def: DEFAULT_MAX_MEM_MB, min: 16, max: 512, step: 8 },
+    { group: '缓冲与内存', type: 'number', key: 'maxBufferSeconds', label: '最大缓冲目标（秒）', def: 600, min: 5, max: 7200, step: 5 },
+    { group: '缓冲与内存', type: 'number', key: 'maxMemoryMb', label: '缓存参考容量（MB，可超出）', def: DEFAULT_MAX_MEM_MB, min: 16, max: 512, step: 8 },
     { group: '请求策略+常规开关', type: 'bool', key: 'prefetchEnabled', label: '并发预取', def: true },
     { group: '请求策略+常规开关', type: 'bool', key: 'memoryCacheEnabled', label: '内存命中 fLoader', def: true },
     { group: '请求策略+常规开关', type: 'number', key: 'prefetchTimeoutMs', label: '预取超时（ms）', def: 15000, min: 1000, max: 120000, step: 500 },
     { group: '请求策略+常规开关', type: 'choice', key: 'prefetchStrategy', label: '预取策略', def: 'xhr-hls-fetch', options: PREFETCH_STRATEGIES }
   ]);
+  const BUFFER_TARGET_KEYS = Object.freeze(['prefetchSeconds', 'forwardBufferSeconds', 'maxBufferSeconds']);
   function isRecord(value) { return !!value && typeof value === 'object' && !Array.isArray(value); }
   function clampInt(value, min, max) { let out = Number.isFinite(value) ? Math.round(value) : 0; if (Number.isFinite(min)) out = Math.max(min, out); if (Number.isFinite(max)) out = Math.min(max, out); return out; }
   function normalizeFieldValue(value, field) {
@@ -70,10 +70,25 @@
   function createDefaultRuntimeConfig() {
     return Object.fromEntries(CONFIG_FIELDS.map(field => [field.key, field.def]));
   }
-  function normalizeRuntimeConfig(candidate) {
+  function normalizeRuntimeConfig(candidate, schemaVersion = SETTINGS_SCHEMA_VERSION) {
     if (isRecord(candidate) && candidate.mseMemoryMb == null && candidate.maxMemoryMb != null) candidate = {...candidate, mseMemoryMb:candidate.maxMemoryMb};
-    const source = isRecord(candidate) ? candidate : {};
-    return Object.fromEntries(CONFIG_FIELDS.map(field => [field.key, normalizeFieldValue(source[field.key], field)]));
+    let source = isRecord(candidate) ? candidate : {};
+    // Migrate published defaults once; customized durations retain their effective target.
+    const legacy = [
+      {key:'prefetchSeconds',type:'number',def:120,min:5,max:7200},
+      {key:'forwardBufferSeconds',type:'number',def:deviceMemoryGb < 4 ? 180 : 600,min:60,max:3600},
+      {key:'maxBufferSeconds',type:'number',def:1800,min:120,max:7200}
+    ];
+    if (schemaVersion < 2 && legacy.some(field=>source[field.key] != null)) {
+      const [prefetch,forward,maximum] = legacy.map(field=>normalizeFieldValue(source[field.key],field));
+      const wasDefault = prefetch === 120 && (forward === 180 || forward === 600) && maximum === 1800;
+      const target = wasDefault ? 600 : Math.max(prefetch,forward,maximum);
+      source = {...source,...Object.fromEntries(BUFFER_TARGET_KEYS.map(key=>[key,target]))};
+    }
+    const runtime = Object.fromEntries(CONFIG_FIELDS.map(field => [field.key, normalizeFieldValue(source[field.key], field)]));
+    const target = Math.max(...BUFFER_TARGET_KEYS.map(key=>runtime[key]));
+    for (const key of BUFFER_TARGET_KEYS) runtime[key] = target;
+    return runtime;
   }
   function normHost(host) { return String(host || '').trim().toLowerCase().replace(/\.+$/, ''); }
   function normalizeHostPattern(pattern) {
@@ -116,7 +131,7 @@
       globalEnabled: source.globalEnabled == null ? defaults.globalEnabled : normalizeFieldValue(source.globalEnabled, { type: 'bool', def: defaults.globalEnabled }),
       debugEnabled: source.debugEnabled == null ? defaults.debugEnabled : normalizeFieldValue(source.debugEnabled, { type: 'bool', def: defaults.debugEnabled }),
       disabledHostPatterns: normalizeHostPatterns(source.disabledHostPatterns),
-      runtime: normalizeRuntimeConfig(source.runtime)
+      runtime: normalizeRuntimeConfig(source.runtime, Number(source.schemaVersion) || 1)
     };
   }
   function assertSupportedSchema(candidate) {
@@ -239,6 +254,15 @@
     modal.id = SB_CFG_MODAL_ID;
     modal.innerHTML = '<div class="panel"><div class="head"><div><h2>⚙️ StreamBoost 全局参数</h2><p class="hint">作用于脚本匹配的所有网站与播放器 iframe；保存后刷新已打开页面生效。</p></div><div class="actions"><button data-act="close">关闭</button><button data-act="reset">恢复默认</button><button class="primary" data-act="save">保存全局配置</button></div></div><div class="layout"><div class="sections" data-zone="sections"></div></div></div>';
     const controls = new Map();
+    const syncTargetControls = (field, value, editingInput = null) => {
+      if (!BUFFER_TARGET_KEYS.includes(field.key)) return;
+      for (const target of CONFIG_FIELDS) {
+        if (!BUFFER_TARGET_KEYS.includes(target.key)) continue;
+        const control = controls.get(target.key);
+        if (control?.num === editingInput) continue;
+        setFieldControlValue(target, control, value);
+      }
+    };
     const sectionsZone = modal.querySelector('[data-zone="sections"]');
     const groups = new Map();
     for (const field of CONFIG_FIELDS) {
@@ -278,8 +302,16 @@
         row.innerHTML += `<div class="num"><input type="range" min="${field.min}" max="${field.max}" step="${field.step || 1}"><input type="number" min="${field.min}" max="${field.max}" step="${field.step || 1}"></div>`;
         const range = row.querySelector('input[type="range"]');
         const num = row.querySelector('input[type="number"]');
-        range.addEventListener('input', () => { num.value = range.value; });
-        num.addEventListener('input', () => { const v = Number(num.value); if (Number.isFinite(v)) range.value = String(clampInt(v, field.min, field.max)); });
+        range.addEventListener('input', () => { num.value = range.value; syncTargetControls(field, range.value); });
+        num.addEventListener('input', () => {
+          if (!num.value.trim()) return;
+          const v = Number(num.value);
+          if (Number.isFinite(v)) {
+            range.value = String(clampInt(v, field.min, field.max));
+            syncTargetControls(field, v, num);
+          }
+        });
+        num.addEventListener('change', () => { syncTargetControls(field, num.value); });
         input = { range, num };
       } else if (field.type === 'choice') {
         const chips = document.createElement('div');
@@ -303,23 +335,10 @@
       controls.set(field.key, input);
     }
     const close = () => modal.remove();
-    const targetHint = document.createElement('p');
-    targetHint.className = 'hint';
-    sectionsZone.prepend(targetHint);
-    const updateTargetHint = () => {
-      const seconds = Math.max(...['forwardBufferSeconds','prefetchSeconds','maxBufferSeconds'].map(key => {
-        const field = CONFIG_FIELDS.find(f => f.key === key);
-        return normalizeFieldValue(controls.get(key).num.value, field);
-      }));
-      targetHint.textContent = '点播提前下载目标：' + seconds + ' 秒。三个时长取最大值，每批片段数不截短总时长；实际下载量受缓存容量和网络限制。';
-    };
-    modal.addEventListener('input', updateTargetHint);
-    updateTargetHint();
     modal.addEventListener('click', (e) => { if (e.target === modal) close(); });
     modal.querySelector('[data-act="close"]').addEventListener('click', close);
     modal.querySelector('[data-act="reset"]').addEventListener('click', () => {
       for (const field of CONFIG_FIELDS) setFieldControlValue(field, controls.get(field.key), field.def);
-      updateTargetHint();
     });
     modal.querySelector('[data-act="save"]').addEventListener('click', () => {
       try {
@@ -393,7 +412,7 @@
   (function(RUNTIME_CONFIG){
     'use strict';
     const DEBUG = RUNTIME_CONFIG.debugEnabled === true;
-    const ACTIVE_MARKER = 'streamboost@1.4.0';
+    const ACTIVE_MARKER = 'streamboost@1.5.0';
     try {
       const firstActivation = window.__HLS_BIGBUF_ACTIVE__ !== ACTIVE_MARKER;
       window.__HLS_BIGBUF_ACTIVE__ = ACTIVE_MARKER;
@@ -429,16 +448,13 @@
     const PREFETCH_TIMEOUT_MS = RUNTIME_CONFIG.prefetchTimeoutMs;
     const WAIT_INFLIGHT_MS = RUNTIME_CONFIG.inflightReuseWaitMs;
     const PREFETCH_STRATEGY = RUNTIME_CONFIG.prefetchStrategy;
-    const FORWARD_BUFFER_SEC = RUNTIME_CONFIG.forwardBufferSeconds;
     const BACK_BUFFER_SEC = RUNTIME_CONFIG.backBufferSeconds;
-    const MAX_MAX_BUFFER_SEC = RUNTIME_CONFIG.maxBufferSeconds;
-    const TARGET_SECONDS = Math.max(FORWARD_BUFFER_SEC, RUNTIME_CONFIG.prefetchSeconds, MAX_MAX_BUFFER_SEC);
+    const TARGET_SECONDS = RUNTIME_CONFIG.prefetchSeconds;
     const FAIL_TTL_MS      = 45000;
     const ORIGIN_BAN_MS    = 10 * 60 * 1000;
     const originFailCount  = new Map();
     const originBanUntil   = new Map();
-    const MAX_MEM_MB = RUNTIME_CONFIG.maxMemoryMb;
-    const MAX_MEM_BYTES = MAX_MEM_MB * 1024 * 1024;
+    const CACHE_BUDGET_BYTES = RUNTIME_CONFIG.maxMemoryMb * 1024 * 1024;
     const MIN_MSE_BUFFER_BYTES = 60 * 1000 * 1000;
     const MSE_BUFFER_BYTES = Math.max(MIN_MSE_BUFFER_BYTES, RUNTIME_CONFIG.mseMemoryMb * 1024 * 1024);
     const log  = (...a)=>{ if (DEBUG) console.log('[HLS BigBuffer]', ...a); };
@@ -447,14 +463,15 @@
       const num = Number(value);
       return Number.isFinite(num) ? Math.max(num, minimum) : minimum;
     }
-    function buildHlsBufferConfig(baseConfig = {}) {
+    function buildHlsBufferConfig(baseConfig = {}, initialConfig = {}) {
+      const minimum = (key, value) => enforceMinNumber(baseConfig[key], enforceMinNumber(initialConfig[key], value));
+      const forward = minimum('maxBufferLength', TARGET_SECONDS);
       return {
-        maxBufferLength: enforceMinNumber(baseConfig.maxBufferLength, FORWARD_BUFFER_SEC),
-        maxMaxBufferLength: Math.max(enforceMinNumber(baseConfig.maxMaxBufferLength, MAX_MAX_BUFFER_SEC),
-          enforceMinNumber(baseConfig.maxBufferLength, FORWARD_BUFFER_SEC)),
-        maxBufferSize: enforceMinNumber(baseConfig.maxBufferSize, MSE_BUFFER_BYTES),
+        maxBufferLength: forward,
+        maxMaxBufferLength: minimum('maxMaxBufferLength', forward),
+        maxBufferSize: minimum('maxBufferSize', MSE_BUFFER_BYTES),
         startFragPrefetch: true,
-        backBufferLength: enforceMinNumber(baseConfig.backBufferLength, BACK_BUFFER_SEC)
+        backBufferLength: minimum('backBufferLength', BACK_BUFFER_SEC)
       };
     }
     function cloneAB(input) {
@@ -483,7 +500,7 @@
     const retiredByMedia = new WeakMap(), retiredScopes = new Set();
     const RETAIN_MS = 30000, diagnosticEvents = [];
     let prebufBytes = 0, sessionSequence = 0, resourceSequence = 0, pumping = false, pageSuspended = false;
-    const metrics = { downloadedBytes: 0, usedBytes: 0, hits: 0, cancelled: 0 };
+    const metrics = { downloadedBytes: 0, usedBytes: 0, hits: 0, cancelled: 0, bufferFlushes: 0 };
     function diagnose(reason, session, extra = {}) {
       if (!DEBUG) return;
       diagnosticEvents.push({time:performance.now(),reason,session:session?.id ?? null,...extra});
@@ -491,7 +508,9 @@
     }
     function deleteCache(key, reason = 'replaced') {
       const entry = prebuf.get(key);
-      if (entry) { prebufBytes -= entry.bytes; prebuf.delete(key); diagnose(reason,null,{bytes:entry.bytes}); }
+      if (entry) {
+        prebufBytes -= entry.bytes; prebuf.delete(key); diagnose(reason,null,{bytes:entry.bytes});
+      }
     }
     function lruGet(key) {
       const entry = prebuf.get(key);
@@ -513,11 +532,14 @@
       session.bufferedResources.delete(key);
       return false;
     }
-    function protectedCache(key, entry) {
+    function inTargetWindow(session, entry) {
+      const w = session.window;
+      return !session.disposed && !!session.hls?.media && session.scope === entry.scope && !!w &&
+        entry.level === w.level && entry.end > w.start && entry.start < w.end;
+    }
+    function protectedCache(entry) {
       for (const session of sessions) {
-        const w = session.window;
-        if (!session.disposed && session.hls?.media && session.scope === entry.scope && w &&
-            entry.level === w.level && entry.end > w.start && entry.start < w.end && !bufferedResource(session,key)) return true;
+        if (inTargetWindow(session,entry)) return true;
       }
       return false;
     }
@@ -527,46 +549,57 @@
       return bytes;
     }
     function makeCacheRoom(bytes, except, replacingKey, session, context, commit = false) {
-      if (bytes > MAX_MEM_BYTES) return false;
-      let needed = prebufBytes - (prebuf.get(replacingKey)?.bytes || 0) + reservedBytes(except) + bytes - MAX_MEM_BYTES;
+      let needed = prebufBytes - (prebuf.get(replacingKey)?.bytes || 0) + reservedBytes(except) + bytes - CACHE_BUDGET_BYTES;
       if (needed <= 0) return true;
       const candidates=[];
       for (const [key,entry] of prebuf) {
         if (key === replacingKey) continue;
-        const farther = session?.scope === entry.scope && context?.frag.level === entry.level && context.frag.start < entry.start;
-        if (protectedCache(key,entry) && !farther) continue;
+        if (protectedCache(entry)) continue;
         let rank=1;
         for (const owner of sessions) {
           if (owner.scope !== entry.scope || !owner.window) continue;
           const w=owner.window;
           if (entry.end <= w.start) { rank=0; break; }
-          if (entry.level === w.level && entry.start < w.end && entry.end > w.start) rank=bufferedResource(owner,key) ? 2 : 3;
         }
         candidates.push({key,entry,rank});
       }
-      candidates.sort((a,b)=>a.rank-b.rank || (a.rank===3 ? b.entry.start-a.entry.start : 0));
+      candidates.sort((a,b)=>a.rank-b.rank);
       const victims=[];
       for (const candidate of candidates) {
-        victims.push(candidate.key); needed-=candidate.entry.bytes;
-        if (needed<=0) {
-          // Admission only reserves reclaimable space. Failed requests never
-          // discard completed resources; successful writes commit atomically.
-          if (commit) for (const key of victims) deleteCache(key,'capacity');
-          return true;
-        }
+        victims.push(candidate); needed-=candidate.entry.bytes;
+        if (needed<=0) break;
       }
-      return false;
+      const frag = context?.frag;
+      const targeted = frag && inTargetWindow(session,{scope:session.scope,level:frag.level,start:frag.start,end:frag.start+frag.duration});
+      // The byte budget triggers reclamation, not a shorter download window.
+      // A zero-byte commit only trims old data as the playback window advances.
+      const admitted = needed <= 0 || bytes === 0 || !!targeted;
+      if (admitted && commit) for (const victim of victims) {
+        diagnose('capacity-eviction',session,{category:victim.rank === 0 ? 'played' : 'outside-window',bytes:victim.entry.bytes});
+        deleteCache(victim.key,'capacity');
+      }
+      return admitted;
     }
     function lruSet(key, buffer, session, context, pending) {
       const bytes = abSize(buffer);
       if (!ENABLE_MEMCACHE || !bytes || session.disposed) return false;
+      if (!pending) {
+        // A completed playback download supersedes its speculative duplicate.
+        for (const entry of inflightMap.values()) {
+          if (entry.session === session && entry.key === key) entry.cancel();
+        }
+      }
       if (!makeCacheRoom(bytes,pending,key,session,context)) {
         session.requiredBytes.set(key,{bytes,start:context.frag.start,end:context.frag.start + context.frag.duration});
         diagnose('capacity-blocked',session,{bytes});
+        if (!pending) diagnose('playback-cache-rejected',session,{cause:'capacity',bytes});
         return false;
       }
       const copy = cloneAB(buffer);
-      if (!copy) return false;
+      if (!copy) {
+        if (!pending) diagnose('playback-cache-rejected',session,{cause:'copy-failed',bytes});
+        return false;
+      }
       makeCacheRoom(bytes,pending,key,session,context,true);
       deleteCache(key);
       const [,playlist,identity] = JSON.parse(key);
@@ -754,8 +787,10 @@
           }
           completeProgress = null;
           phase = 'done'; clearTimeout(this.waitTimer);
+          this.cancelLoad = null;
           release();
           if (this.inner.stats) this.stats = this.inner.stats;
+          if (name === 'onAbort') this.stats.aborted = true;
           callbacks[name]?.(...args);
         };
         const deliver = buffer => {
@@ -765,10 +800,11 @@
             chunkCount: 1, bwEstimate: 0, loading: { start: now, first: now, end: now },
             parsing: { start: 0, end: 0 }, buffering: { start: 0, first: 0, end: 0 },
             trequest: now, tfirst: now, tload: now });
-          phase = 'done'; clearTimeout(this.waitTimer);
-          release();
+          phase = 'delivering'; clearTimeout(this.waitTimer);
           callbacks.onProgress?.(this.stats, context, cloneAB(buffer), null);
-          if (generation === this.generation) callbacks.onSuccess?.({url:context.url, data:buffer}, this.stats, context, null);
+          if (!valid() || phase !== 'delivering') return;
+          phase = 'done'; this.cancelLoad = null; release();
+          callbacks.onSuccess?.({url:context.url, data:buffer}, this.stats, context, null);
         };
         const goInner = () => {
           if (!valid() || phase !== 'waiting') return;
@@ -796,7 +832,7 @@
             this.waitTimer = setTimeout(goInner, WAIT_INFLIGHT_MS);
             pending.promise.then(buffer => {
               if (!valid() || phase !== 'waiting') return;
-              const copy = buffer && scope === this.session.scope && resourceKey(this.session,context) === key && (lruGet(key) || cloneAB(buffer));
+              const copy = scope === this.session.scope && resourceKey(this.session,context) === key && (lruGet(key) || (buffer && cloneAB(buffer)));
               if (copy) deliver(copy); else goInner();
             }, goInner);
             return;
@@ -806,10 +842,12 @@
       }
       abort() {
         this.generation++; clearTimeout(this.waitTimer);
-        if (this.stats) this.stats.aborted = true;
         const cancel = this.cancelLoad; this.cancelLoad = null;
-        try { this.inner?.abort?.(); } catch {}
-        cancel?.();
+        if (cancel) {
+          if (this.stats) this.stats.aborted = true;
+          try { this.inner?.abort?.(); } catch {}
+          cancel();
+        }
       }
       destroy() { this.abort(); try { this.inner?.destroy?.(); } catch {} }
       getCacheAge() { return this.inner?.getCacheAge?.() ?? null; }
@@ -887,7 +925,10 @@
         reserved:session.requiredBytes.get(key)?.bytes || session.estimate };
       let resolve;
       entry.promise = new Promise(r => { resolve = r; });
-      entry.cancel = () => { entry.cancelled = true; entry.stopTransport?.(); };
+      entry.cancel = () => {
+        if (entry.cancelled) return;
+        entry.cancelled = true; entry.reserved = 0; entry.stopTransport?.();
+      };
       inflightMap.set(pendingKey, entry);
       originSlots.set(origin, (originSlots.get(origin) || 0) + 1);
       const started = performance.now();
@@ -977,10 +1018,79 @@
         }
       } finally { pumping = false; }
     }
-    function attachPrefetch(hls, session, Ev) {
+    function resetBufferRecovery(session) {
+      const recovery = session.bufferRecovery;
+      if (!recovery) return;
+      const attempt = recovery.attempt;
+      if (attempt && session.hls?.config.maxMaxBufferLength === attempt.target) {
+        session.hls.config.maxMaxBufferLength = attempt.previous;
+      }
+      recovery.baseline = null; recovery.attempt = null;
+    }
+    function recordBufferPressure(session) {
+      resetBufferRecovery(session);
+      const failures = Math.min(3,(session.bufferRecovery?.failures ?? -1)+1);
+      session.bufferPressure = true;
+      session.bufferRecovery = {failures,nextAt:performance.now()+60000*2**failures,baseline:null,attempt:null};
+      diagnose('buffer-capacity-pressure',session,{cooldownSeconds:60*2**failures});
+    }
+    function recoverBufferTarget(session) {
+      const recovery = session.bufferRecovery, hls = session.hls, media = hls?.media;
+      if (!recovery || session.disposed || !media || pageSuspended) return;
+      const level = hls.currentLevel, details = hls.levels?.[level]?.details;
+      if (session.manifestPending || session.source !== hls.url || level !== hls.loadLevel ||
+          !details || details.live || session.staleDetails?.has(details) || media.seeking) {
+        resetBufferRecovery(session); return;
+      }
+      if (media.paused || media.readyState < 3) return;
+      const time = media.currentTime, ranges = media.buffered;
+      let span;
+      for (let i=0;i<ranges.length;i++) {
+        if (ranges.start(i) <= time+0.05 && ranges.end(i) > time) {
+          span = {start:ranges.start(i),end:ranges.end(i)}; break;
+        }
+      }
+      if (!span) { resetBufferRecovery(session); return; }
+      const now = performance.now(), baseline = recovery.baseline;
+      if (!baseline) {
+        recovery.baseline = {time,start:span.start,lastTime:time,lastEnd:span.end,level};
+        return;
+      }
+      if (level !== baseline.level || time < baseline.lastTime || span.start > baseline.lastEnd+0.05 ||
+          span.end < baseline.lastEnd-0.05) {
+        resetBufferRecovery(session); return;
+      }
+      baseline.lastTime = time; baseline.lastEnd = span.end;
+      const limit = hls.config.maxMaxBufferLength, ahead = span.end-time, attempt = recovery.attempt;
+      if (attempt) {
+        if (limit !== attempt.target) { resetBufferRecovery(session); return; }
+        if (attempt.appended && span.end > attempt.end+0.05 && ahead >= attempt.target-0.1) {
+          recovery.attempt = null; recovery.baseline = null; recovery.nextAt = now+60000;
+          diagnose('buffer-recovery-confirmed',session,{targetSeconds:limit,aheadSeconds:ahead});
+        }
+        return;
+      }
+      const duration = details.levelTargetDuration || details.targetduration;
+      const goal = session.bufferTargets.maxMaxBufferLength;
+      if (!(duration > 0) || !Number.isFinite(duration) || !Number.isFinite(limit) || limit >= goal ||
+          now < recovery.nextAt || time-baseline.time < 30 || span.start-baseline.start < duration ||
+          ahead < limit-duration) return;
+      const target = Math.min(goal,limit+Math.max(duration,Math.min(30,limit*0.1)));
+      if (Number.isFinite(media.duration) && media.duration-time < target) return;
+      recovery.attempt = {previous:limit,target,end:span.end,appended:false};
+      recovery.nextAt = now+60000;
+      hls.config.maxMaxBufferLength = target;
+      diagnose('buffer-recovery-attempt',session,{previousSeconds:limit,targetSeconds:target,aheadSeconds:ahead});
+    }
+    function attachPrefetch(hls, session, Ev, Errors) {
       sessions.add(session); session.hls = hls;
       const listeners = [];
       const on = (event, fn) => { if (event) { hls.on(event,fn); listeners.push([event,fn]); } };
+      on(Ev.ERROR,(_event,data) => {
+        if (Errors && data?.details === Errors.BUFFER_FULL_ERROR) {
+          recordBufferPressure(session);
+        }
+      });
       let media, scheduled = false;
       const contextFor = frag => {
         let url;
@@ -994,6 +1104,7 @@
       const refresh = () => {
         session.queue = [];
         if (session.disposed || !media || pageSuspended) { session.stopReason='detached'; return; }
+        recoverBufferTarget(session);
         if (!ENABLE_PREFETCH || !ENABLE_MEMCACHE || !PREFETCH_AHEAD) { session.stopReason='disabled'; return; }
         if (RUNTIME_CONFIG.adaptivePrefetch && navigator.connection?.saveData) { session.stopReason='save-data'; return; }
         const level = hls.loadLevel >= 0 ? hls.loadLevel : hls.currentLevel;
@@ -1002,7 +1113,7 @@
           session.stopReason='playlist-unconfirmed'; return;
         }
         const fragments = details.fragments, start = media.currentTime;
-        const horizon = details.live ? (RUNTIME_CONFIG.adaptivePrefetch ? Math.min(12,RUNTIME_CONFIG.prefetchSeconds) : RUNTIME_CONFIG.prefetchSeconds) : TARGET_SECONDS;
+        const horizon = details.live && RUNTIME_CONFIG.adaptivePrefetch ? Math.min(12,TARGET_SECONDS) : TARGET_SECONDS;
         session.targetSeconds = horizon;
         const end = Math.min(start + horizon, fragments.length ? fragments.at(-1).start + fragments.at(-1).duration : start);
         // Confirm the scope before publishing the window: identity changes cancel tasks.
@@ -1014,6 +1125,7 @@
           const f = entry.context.frag;
           if (entry.session === session && (f.level !== level || f.start + f.duration <= start || f.start >= end)) entry.cancel();
         }
+        makeCacheRoom(0,null,null,session,null,true);
         for (const [key,required] of session.requiredBytes) {
           const identity = JSON.parse(key)[2];
           if (required.end <= start || required.start >= end || !session.catalog.get(level)?.record.members.has(identity)) session.requiredBytes.delete(key);
@@ -1050,8 +1162,9 @@
         scheduled = true;
         queueMicrotask(() => { scheduled=false; refresh(); });
       };
-      const seeking = () => { cancelTasks(session,'seek'); session.schedule(); };
+      const seeking = () => { resetBufferRecovery(session); cancelTasks(session,'seek'); session.schedule(); };
       const unbind = () => {
+        resetBufferRecovery(session);
         media?.removeEventListener('seeking',seeking);
         media?.removeEventListener('timeupdate',session.schedule);
         session.bufferedResources.clear();
@@ -1069,17 +1182,29 @@
         unbind(); media=null; session.mediaRef=null; cancelTasks(session,'media-detached');
       });
       on(Ev.MANIFEST_LOADING,(_event,data) => {
-        cancelTasks(session,'manifest-loading'); session.source = hls.url || data?.url;
+        const source = hls.url || data?.url;
+        resetBufferRecovery(session);
+        if (source !== session.source) { session.bufferPressure = false; session.bufferRecovery = null; }
+        cancelTasks(session,'manifest-loading'); session.source = source;
         session.bufferedResources.clear();
         session.staleDetails = new WeakSet([...session.catalog.values()].map(item=>item.details));
         session.manifestPending = true; session.catalog.clear(); ensureScope(session);
       });
       on(Ev.MANIFEST_PARSED,() => { session.manifestPending = false; session.schedule(); });
       on(Ev.LEVEL_LOADED,(_event,data) => {
+        if (data?.details && !data.details.live && !session.bufferPressure) {
+          const targets = buildHlsBufferConfig(hls.config,session.bufferTargets);
+          Object.assign(hls.config,targets);
+          diagnose('buffer-config-applied',session,{cause:'vod-playlist',...targets});
+        }
         session.manifestPending = false; confirmPlaylist(session,data.level,data.details); session.schedule();
       });
-      on(Ev.LEVEL_SWITCHING,() => { cancelTasks(session,'level-switch'); session.schedule(); });
+      on(Ev.LEVEL_SWITCHING,() => { resetBufferRecovery(session); cancelTasks(session,'level-switch'); session.schedule(); });
       on(Ev.FRAG_BUFFERED,(_event,data) => {
+        const attempt = session.bufferRecovery?.attempt, frag = data?.frag;
+        if (attempt && !data.part && frag?.type === 'main' && frag.level === hls.currentLevel &&
+            hls.currentLevel === hls.loadLevel && session.source === hls.url && !session.manifestPending &&
+            frag.start+frag.duration > attempt.end+0.05) attempt.appended = true;
         const context = data?.frag && contextFor(data.frag);
         const key = context && !data.part && resourceKey(session,context);
         if (key) {
@@ -1093,8 +1218,17 @@
         session.schedule();
       });
       on(Ev.BUFFER_FLUSHING,(_event,data) => {
+        // Routine removal behind the playhead is the release evidence we need.
+        // Clearing current/future content instead invalidates the observation.
+        if (!media || data.endOffset > media.currentTime) resetBufferRecovery(session);
+        metrics.bufferFlushes++;
+        diagnose('buffer-flushing',session,{start:data.startOffset,end:Number.isFinite(data.endOffset) ? data.endOffset : 'Infinity'});
         for (const [key,span] of session.bufferedResources) {
           if (span.start < data.endOffset && span.end > data.startOffset) session.bufferedResources.delete(key);
+        }
+        for (const entry of inflightMap.values()) {
+          const frag = entry.context.frag;
+          if (entry.session === session && frag.start < data.endOffset && frag.start + frag.duration > data.startOffset) entry.cancel();
         }
       });
       on(Ev.BUFFER_FLUSHED,session.schedule);
@@ -1108,7 +1242,7 @@
     }
     window.addEventListener('pagehide', () => {
       pageSuspended = true;
-      for (const session of sessions) { cancelTasks(session,'page-hidden'); invalidateScope(session.scope,'page-hidden'); session.catalog.clear(); }
+      for (const session of sessions) { resetBufferRecovery(session); cancelTasks(session,'page-hidden'); invalidateScope(session.scope,'page-hidden'); session.catalog.clear(); }
       for (const scope of retiredScopes) invalidateScope(scope,'page-hidden');
     });
     window.addEventListener('pageshow', () => { pageSuspended = false; for (const session of sessions) session.schedule?.(); });
@@ -1121,17 +1255,38 @@
       }
       return out;
     }
-    if (DEBUG) window.__STREAMBOOST_DIAGNOSTICS__ = () => ({...metrics,cacheBytes:prebufBytes,reservedBytes:reservedBytes(),activeRequests:inflightMap.size,sessions:sessions.size,
+    function getSessionCoverage(session) {
+      const hls = session.hls, media = hls?.media, buffered = media?.buffered;
+      const nativeRanges = buffered ? Array.from({length:buffered.length},(_,i)=>[buffered.start(i),buffered.end(i)]) : [];
+      const level = hls?.loadLevel >= 0 ? hls.loadLevel : hls?.currentLevel;
+      const playlist = session.catalog.get(level);
+      const valid = ENABLE_MEMCACHE && !session.disposed && !pageSuspended && !session.manifestPending &&
+        session.scope?.source === hls?.url && level === hls?.currentLevel && playlist?.record.active &&
+        playlist.details === hls.levels?.[level]?.details &&
+        requestContract(session).every((value,index)=>value === session.contract?.[index]);
+      const cacheRanges = mergeRanges(valid ? [...prebuf.values()].filter(entry=>
+        entry.scope === session.scope && entry.level === level && entry.playlist === playlist.record.id &&
+        playlist.record.members.has(entry.identity) && !isDetached(entry.buffer) && abSize(entry.buffer) > 0 &&
+        Number.isFinite(entry.start) && Number.isFinite(entry.end) && entry.end > entry.start
+      ).map(entry=>[entry.start,entry.end]) : []);
+      const availableRanges = mergeRanges([...nativeRanges,...cacheRanges]);
+      const time = media?.currentTime ?? 0;
+      const continuous = availableRanges.find(range=>range[0] <= time+0.05 && range[1] > time);
+      return {cacheRanges,availableRanges,downloadedAheadSeconds:continuous ? continuous[1]-time : 0};
+    }
+    if (DEBUG) window.__STREAMBOOST_DIAGNOSTICS__ = () => ({...metrics,cacheBytes:prebufBytes,cacheBudgetBytes:CACHE_BUDGET_BYTES,
+      overBudgetBytes:Math.max(0,prebufBytes-CACHE_BUDGET_BYTES),reservedBytes:reservedBytes(),activeRequests:inflightMap.size,sessions:sessions.size,
       events:diagnosticEvents.map(e=>({...e})),retainedScopes:retiredScopes.size,
       players:[...sessions].map(s=>{
         const media = s.hls?.media, buffered = media?.buffered;
-        const cacheRanges = mergeRanges([...prebuf.values()].filter(e=>e.scope===s.scope && e.level===s.window?.level && Number.isFinite(e.start)).map(e=>[e.start,e.end]));
-        const confirmed = [...s.bufferedResources].filter(([key,span])=>span.level===s.window?.level && bufferedResource(s,key)).map(([,span])=>[span.start,span.end]);
-        const availableRanges = mergeRanges([...cacheRanges,...confirmed]);
-        const time=media?.currentTime ?? 0, continuous=availableRanges.find(r=>r[0]<=time+0.05 && r[1]>time);
+        const {cacheRanges,availableRanges,downloadedAheadSeconds} = getSessionCoverage(s);
         return {id:s.id,taskGeneration:s.epoch,queued:s.queue.length,resource:s.scope?.id ?? null,
           targetSeconds:s.targetSeconds ?? TARGET_SECONDS,window:s.window ? {...s.window} : null,stopReason:s.stopReason,
-          cacheRanges,availableRanges,downloadedAheadSeconds:continuous ? continuous[1]-time : 0,
+          cacheRanges,availableRanges,downloadedAheadSeconds,bufferPressure:s.bufferPressure,
+          bufferRecovery:s.bufferRecovery ? {failures:s.bufferRecovery.failures,
+            retryInSeconds:Math.max(0,(s.bufferRecovery.nextAt-performance.now())/1000),
+            pendingTarget:s.bufferRecovery.attempt?.target ?? null} : null,
+          effectiveBuffer:{forwardSeconds:s.hls.config.maxBufferLength,maximumSeconds:s.hls.config.maxMaxBufferLength,bytes:s.hls.config.maxBufferSize},
           attached:!!media,currentTime:media?.currentTime ?? null,level:s.hls?.currentLevel ?? null,
           buffered:buffered ? Array.from({length:buffered.length},(_,i)=>[buffered.start(i),buffered.end(i)]) : []};
       })});
@@ -1161,20 +1316,42 @@
         class PatchedHls extends OriginalHls {
           constructor(userConfig = {}){
             if (!userConfig || typeof userConfig !== 'object') userConfig = {};
-            const enforced = Object.assign({}, userConfig, buildHlsBufferConfig(userConfig));
             const originalConfig = Object.assign({},OriginalHls.DefaultConfig,userConfig);
+            const bufferTargets = buildHlsBufferConfig(originalConfig);
+            const enforced = Object.assign({},userConfig,bufferTargets);
             const Loader = originalConfig.fLoader || originalConfig.loader;
             const session = {id:++sessionSequence,epoch:0,Loader,custom:!!(originalConfig.fLoader || userConfig.loader ||
               originalConfig.loader !== initialDefaultLoader),catalog:new Map(),
+              bufferTargets,bufferPressure:false,
               disposed:false,queue:[],demands:new Map(),bufferedResources:new Map(),requiredBytes:new Map(),estimate:2*1024*1024,limit:PREFETCH_CONC_GLOBAL,badSamples:0,goodSamples:0};
             if (ENABLE_MEMCACHE && typeof Loader === 'function') {
               enforced.fLoader = class extends CacheFirstFragLoader { constructor(cfg) { super(cfg,session); } };
             }
             super(enforced);
             this.__streamboostSession = session;
-            attachPrefetch(this,session,OriginalHls.Events);
+            attachPrefetch(this,session,OriginalHls.Events,OriginalHls.ErrorDetails);
+            diagnose('buffer-config-applied',session,{cause:'created',...bufferTargets});
             window.__HLS_BIGBUF_LAST__ = this;
             log('Hls instance created', {prefetch:ENABLE_PREFETCH,memcache:ENABLE_MEMCACHE});
+          }
+          get currentLevel() { return super.currentLevel; }
+          set currentLevel(level) {
+            const session = this.__streamboostSession, media = this.media;
+            // Re-selecting an established manual level is idempotent. Initial
+            // selection, pending switches and unbuffered recovery keep Hls semantics.
+            if (session && !session.disposed && !session.manifestPending && session.source === this.url &&
+                Number.isInteger(level) && level >= 0 && level === super.currentLevel &&
+                level === this.loadLevel && level === this.manualLevel && media &&
+                !media.seeking && media.readyState >= 3) {
+              const time = media.currentTime, buffered = media.buffered;
+              for (let i=0;i<buffered.length;i++) {
+                if (buffered.start(i) <= time && time < buffered.end(i)) {
+                  diagnose('level-selection-unchanged',session,{level});
+                  return;
+                }
+              }
+            }
+            super.currentLevel = level;
           }
           destroy() {
             disposeSession(this.__streamboostSession);
