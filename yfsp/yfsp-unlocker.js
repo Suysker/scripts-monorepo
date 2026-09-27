@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         YFSP.TV Unlocker
 // @namespace    http://tampermonkey.net/
-// @version      1.10.0
+// @version      1.10.1
 // @description  Uses the Windows client's playback endpoint, maps available HLS qualities, shows actual resolution and tunes VOD buffering. Adds click-to-toggle and container fullscreen.
 // @author       YFSP Analyst
 // @match        *://*.yfsp.tv/*
@@ -320,6 +320,9 @@ iframe[src*="doubleclick"],
         GM_registerMenuCommand('开启／关闭每日自动签到', () => {
             GM_setValue('yfsp.autoCheckIn', !readPreference('yfsp.autoCheckIn', true));
         });
+        GM_registerMenuCommand('开启／关闭每日分享任务', () => {
+            GM_setValue('yfsp.autoShare', !readPreference('yfsp.autoShare', true));
+        });
     };
 
     // Compatibility is local to UI components. Never mutate the account service,
@@ -372,7 +375,7 @@ iframe[src*="doubleclick"],
 
     const checkInMemory = new Map();
     const checkInPending = new Set();
-    let nextCheckInScan = 0;
+    let nextDailyTaskScan = 0;
     const checkInStored = (key) => {
         try {
             const value = (typeof GM_getValue === 'function' ? GM_getValue(key, null) : null) ?? checkInMemory.get(key);
@@ -414,17 +417,25 @@ iframe[src*="doubleclick"],
             typeof service?.getSignInData !== 'function' || typeof service?.signInSubmit !== 'function') return null;
         return { service, users, helper, uid: Number(user.id), token: helper.token.token };
     };
-    const runDailyCheckIn = async (component) => {
-        if (!readPreference('yfsp.autoCheckIn', true)) return;
+    const nextDailyCheck = (status) => {
+        const midnight = new Date(); midnight.setHours(24, 0, 0, 0);
+        const seconds = Number(status?.sign_after);
+        return Number.isFinite(seconds) && seconds > 0 ?
+            Date.now() + Math.min(seconds, 172800) * 1000 : midnight.getTime();
+    };
+    // Account identity, throttling and cross-tab ownership are shared by daily
+    // tasks; each task owns its server operation and completion check.
+    const runDailyTask = async (component, task, preference, execute) => {
+        if (!readPreference(preference, true)) return;
         const context = getCheckInContext(component);
         if (!context) return;
-        const { service, users, helper, uid, token } = context;
-        const key = `yfsp.checkIn.${location.hostname}.${uid}`;
+        const { helper, uid, token } = context;
+        const key = `yfsp.${task}.${location.hostname}.${uid}`;
         if (checkInPending.has(key) || Number(checkInStored(key)?.nextCheck) > Date.now()) return;
         checkInPending.add(key);
         const stillCurrent = () => {
             const current = getCheckInContext(component);
-            return readPreference('yfsp.autoCheckIn', true) && current?.uid === uid && current.token === token;
+            return readPreference(preference, true) && current?.uid === uid && current.token === token;
         };
         const work = async () => {
             if (!stillCurrent() || Number(checkInStored(key)?.nextCheck) > Date.now()) return;
@@ -435,40 +446,15 @@ iframe[src*="doubleclick"],
                 if (name === 'globalHandler') return data => data?.code === 0;
                 return Reflect.get(target, name, receiver);
             } });
-            const quietService = Object.create(service, { httpClientHelper: { value: quietHelper } });
-            const readStatus = async () => {
-                const response = await signInValue(service.getSignInData.call(quietService, uid));
-                const status = Array.isArray(response) ? response[0] : null;
-                if (!status || ![0, 1].includes(status.bonus_status)) throw new Error('unknown check-in status');
-                return status;
-            };
             try {
-                let status = await readStatus();
-                if (!stillCurrent()) return;
-                let reward;
-                if (status.bonus_status === 0) {
-                    const response = await signInValue(service.signInSubmit.call(quietService));
-                    if (!stillCurrent()) return;
-                    reward = Array.isArray(response) ? response[0] : null;
-                    status = await readStatus();
+                const nextCheck = await execute({ ...context, quietHelper, stillCurrent });
+                if (stillCurrent() && Number.isFinite(nextCheck) && nextCheck > Date.now()) {
+                    saveCheckIn(key, { nextCheck, confirmed: true });
+                    featureStatus.set(`daily-${task}`, 'confirmed');
+                } else if (stillCurrent()) {
+                    featureStatus.set(`daily-${task}`, 'unconfirmed');
                 }
-                if (!stillCurrent() || status.bonus_status !== 1) return;
-                const midnight = new Date(); midnight.setHours(24, 0, 0, 0);
-                const seconds = Number(status.sign_after);
-                const nextCheck = Number.isFinite(seconds) && seconds > 0 ?
-                    Date.now() + Math.min(seconds, 172800) * 1000 : midnight.getTime();
-                saveCheckIn(key, { nextCheck, confirmed: true });
-                service.setNewState?.(status);
-                service.afterSigned?.(true);
-                if (reward && typeof users.updateUserData === 'function') {
-                    const update = {};
-                    for (const [field, source] of Object.entries({ dnCoins: 'gold', experience: 'experience',
-                        level: 'currentLevel', expToNextLevel: 'nextLevel' })) {
-                        if (Number.isFinite(reward[source])) update[field] = reward[source];
-                    }
-                    if (Object.keys(update).length) users.updateUserData(update);
-                }
-            } catch { /* Quiet failure; no account data in logs. */ }
+            } catch { featureStatus.set(`daily-${task}`, 'failed'); }
         };
         try {
             if (navigator.locks?.request) {
@@ -487,11 +473,78 @@ iframe[src*="doubleclick"],
         } catch { /* Feature failures must not interrupt playback. */ }
         finally { checkInPending.delete(key); }
     };
-    const autoCheckIn = () => {
-        if (Date.now() < nextCheckInScan || !readPreference('yfsp.autoCheckIn', true)) return;
-        nextCheckInScan = Date.now() + 15000;
+    const runDailyCheckIn = (component) => runDailyTask(component, 'checkIn', 'yfsp.autoCheckIn',
+        async ({ service, users, uid, quietHelper, stillCurrent }) => {
+            const quietService = Object.create(service, { httpClientHelper: { value: quietHelper } });
+            const readStatus = async () => {
+                const response = await signInValue(service.getSignInData.call(quietService, uid));
+                const status = Array.isArray(response) ? response[0] : null;
+                if (!status || ![0, 1].includes(status.bonus_status)) throw new Error('unknown check-in status');
+                return status;
+            };
+            let status = await readStatus();
+            if (!stillCurrent()) return;
+            let reward;
+            if (status.bonus_status === 0) {
+                const response = await signInValue(service.signInSubmit.call(quietService));
+                if (!stillCurrent()) return;
+                reward = Array.isArray(response) ? response[0] : null;
+                status = await readStatus();
+            }
+            if (!stillCurrent() || status.bonus_status !== 1) return;
+            service.setNewState?.(status);
+            service.afterSigned?.(true);
+            if (reward && typeof users.updateUserData === 'function') {
+                const update = {};
+                for (const [field, source] of Object.entries({ dnCoins: 'gold', experience: 'experience',
+                    level: 'currentLevel', expToNextLevel: 'nextLevel' })) {
+                    if (Number.isFinite(reward[source])) update[field] = reward[source];
+                }
+                if (Object.keys(update).length) users.updateUserData(update);
+            }
+            return nextDailyCheck(status);
+        });
+    const runDailyShare = (component, videoComponent) => {
+        const videoId = videoComponent?.video?.id;
+        const videoService = videoComponent?._videoService;
+        if (!Number.isSafeInteger(videoId) || videoId <= 0 || typeof videoService?.share !== 'function') return;
+        return runDailyTask(component, 'share', 'yfsp.autoShare',
+            async ({ service, uid, quietHelper, stillCurrent }) => {
+                const url = service._apiHelper.APIV3_ENDPOINT('api') + '/Task/GetAllTask?tasktype=1';
+                const readStatus = async () => {
+                    const tasks = await signInValue(quietHelper.get(url));
+                    // Native video-share uses userActionType=21. Do not trigger
+                    // upload, invitation or other tasks returned in this list.
+                    const task = Array.isArray(tasks) ? tasks.find(item => item.userActionType === 21) : null;
+                    if (!task || ![0, 1].includes(task.status)) throw new Error('unknown share task status');
+                    return task;
+                };
+                let status = await readStatus();
+                if (!stillCurrent()) return;
+                if (status.status === 0) {
+                    if (videoComponent.video?.id !== videoId) return;
+                    const quietVideoService = Object.create(videoService, { _httpClientHelper: { value: quietHelper } });
+                    await signInValue(videoService.share.call(quietVideoService, videoId));
+                    if (!stillCurrent()) return;
+                    status = await readStatus();
+                }
+                if (!stillCurrent() || status.status !== 1) return;
+                // The sign-in service exposes the site's daily reset countdown.
+                const quietService = Object.create(service, { httpClientHelper: { value: quietHelper } });
+                const reset = await signInValue(service.getSignInData.call(quietService, uid));
+                return nextDailyCheck(Array.isArray(reset) ? reset[0] : null);
+            });
+    };
+    const autoDailyTasks = () => {
+        if (Date.now() < nextDailyTaskScan) return;
+        nextDailyTaskScan = Date.now() + 15000;
         const component = findAngularComponent('app-dn-menu', entry => entry?.signInService && entry?._userService);
-        if (component) void runDailyCheckIn(component);
+        if (!component) return;
+        void runDailyCheckIn(component);
+        if (readPreference('yfsp.autoShare', true)) {
+            const video = findAngularComponent('aa-videoplayer', entry => entry?.video?.id && typeof entry?._videoService?.share === 'function');
+            if (video) void runDailyShare(component, video);
+        }
     };
 
     const unlockList = (list) => {
@@ -1281,7 +1334,7 @@ iframe[src*="doubleclick"],
     const refreshDynamicFeatures = () => {
         runFeature('style', () => { ensureStyle(); hideAds(); });
         hookAngular();
-        runFeature('check-in', autoCheckIn);
+        runFeature('daily-tasks', autoDailyTasks);
         runFeature('playback-status', updatePlaybackExperience);
     };
     const bootstrap = () => {
