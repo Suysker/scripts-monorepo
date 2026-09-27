@@ -3,7 +3,7 @@
 // @namespace    streamboost
 // @icon         https://image.suysker.xyz/i/2023/10/09/artworks-QOnSW1HR08BDMoe9-GJTeew-t500x500.webp
 // @namespace    http://tampermonkey.net/
-// @version      1.3.1
+// @version      1.4.0
 // @description  通用流媒体加速：加大缓冲、并发预取、内存命中、在途合并、按站点启停、修复部分站点自定义 Loader 导致的串行；当前覆盖 HLS.js，后续可扩展至其它播放器/协议。
 // @match        *://*/*
 // @run-at       document-start
@@ -33,16 +33,16 @@
     { value: 'fetch-xhr-hls', label: 'fetch-xhr-hls' }
   ]);
   const CONFIG_FIELDS = Object.freeze([
-    { group: '预取并发', type: 'number', key: 'prefetchSeconds', label: '预取前瞻秒数上限', def: 120, min: 5, max: 600, step: 5 },
+    { group: '预取并发', type: 'number', key: 'prefetchSeconds', label: '预取目标（秒）', def: 120, min: 5, max: 7200, step: 5 },
     { group: '请求策略+常规开关', type: 'bool', key: 'adaptivePrefetch', label: '实验性自适应预取（含省流量/直播策略）', def: false },
     { group: '缓冲与内存', type: 'number', key: 'mseMemoryMb', label: 'MSE 缓冲目标（至少，MB）', def: DEFAULT_MAX_MEM_MB, min: 16, max: 512, step: 8 },
-    { group: '预取并发', type: 'number', key: 'prefetchAhead', label: '预取前瞻片段数', def: 12, min: 0, max: 60, step: 1 },
+    { group: '预取并发', type: 'number', key: 'prefetchAhead', label: '每批预取片段数（0 为关闭）', def: 12, min: 0, max: 60, step: 1 },
     { group: '预取并发', type: 'number', key: 'maxConcurrentPrefetches', label: '页面总预取并发上限', def: 4, min: 1, max: 16, step: 1 },
     { group: '预取并发', type: 'number', key: 'maxConcurrentPrefetchesPerOrigin', label: '单资源 Origin 并发上限', def: 4, min: 1, max: 16, step: 1 },
     { group: '预取并发', type: 'number', key: 'inflightReuseWaitMs', label: '在途复用等待（ms）', def: 500, min: 0, max: 10000, step: 50 },
-    { group: '缓冲与内存', type: 'number', key: 'forwardBufferSeconds', label: 'HLS 前向目标（至少，秒）', def: DEFAULT_FORWARD_BUFFER_SEC, min: 60, max: 3600, step: 30 },
+    { group: '缓冲与内存', type: 'number', key: 'forwardBufferSeconds', label: '前向目标（秒）', def: DEFAULT_FORWARD_BUFFER_SEC, min: 60, max: 3600, step: 30 },
     { group: '缓冲与内存', type: 'number', key: 'backBufferSeconds', label: '回看目标（至少，秒）', def: 180, min: 0, max: 1800, step: 30 },
-    { group: '缓冲与内存', type: 'number', key: 'maxBufferSeconds', label: '最大缓冲目标（至少，秒）', def: 1800, min: 120, max: 7200, step: 60 },
+    { group: '缓冲与内存', type: 'number', key: 'maxBufferSeconds', label: '最大缓冲目标（秒）', def: 1800, min: 120, max: 7200, step: 60 },
     { group: '缓冲与内存', type: 'number', key: 'maxMemoryMb', label: 'LRU 缓存上限（MB）', def: DEFAULT_MAX_MEM_MB, min: 16, max: 512, step: 8 },
     { group: '请求策略+常规开关', type: 'bool', key: 'prefetchEnabled', label: '并发预取', def: true },
     { group: '请求策略+常规开关', type: 'bool', key: 'memoryCacheEnabled', label: '内存命中 fLoader', def: true },
@@ -303,10 +303,23 @@
       controls.set(field.key, input);
     }
     const close = () => modal.remove();
+    const targetHint = document.createElement('p');
+    targetHint.className = 'hint';
+    sectionsZone.prepend(targetHint);
+    const updateTargetHint = () => {
+      const seconds = Math.max(...['forwardBufferSeconds','prefetchSeconds','maxBufferSeconds'].map(key => {
+        const field = CONFIG_FIELDS.find(f => f.key === key);
+        return normalizeFieldValue(controls.get(key).num.value, field);
+      }));
+      targetHint.textContent = '点播提前下载目标：' + seconds + ' 秒。三个时长取最大值，每批片段数不截短总时长；实际下载量受缓存容量和网络限制。';
+    };
+    modal.addEventListener('input', updateTargetHint);
+    updateTargetHint();
     modal.addEventListener('click', (e) => { if (e.target === modal) close(); });
     modal.querySelector('[data-act="close"]').addEventListener('click', close);
     modal.querySelector('[data-act="reset"]').addEventListener('click', () => {
       for (const field of CONFIG_FIELDS) setFieldControlValue(field, controls.get(field.key), field.def);
+      updateTargetHint();
     });
     modal.querySelector('[data-act="save"]').addEventListener('click', () => {
       try {
@@ -380,7 +393,7 @@
   (function(RUNTIME_CONFIG){
     'use strict';
     const DEBUG = RUNTIME_CONFIG.debugEnabled === true;
-    const ACTIVE_MARKER = 'streamboost@1.3.1';
+    const ACTIVE_MARKER = 'streamboost@1.4.0';
     try {
       const firstActivation = window.__HLS_BIGBUF_ACTIVE__ !== ACTIVE_MARKER;
       window.__HLS_BIGBUF_ACTIVE__ = ACTIVE_MARKER;
@@ -419,6 +432,7 @@
     const FORWARD_BUFFER_SEC = RUNTIME_CONFIG.forwardBufferSeconds;
     const BACK_BUFFER_SEC = RUNTIME_CONFIG.backBufferSeconds;
     const MAX_MAX_BUFFER_SEC = RUNTIME_CONFIG.maxBufferSeconds;
+    const TARGET_SECONDS = Math.max(FORWARD_BUFFER_SEC, RUNTIME_CONFIG.prefetchSeconds, MAX_MAX_BUFFER_SEC);
     const FAIL_TTL_MS      = 45000;
     const ORIGIN_BAN_MS    = 10 * 60 * 1000;
     const originFailCount  = new Map();
@@ -436,7 +450,8 @@
     function buildHlsBufferConfig(baseConfig = {}) {
       return {
         maxBufferLength: enforceMinNumber(baseConfig.maxBufferLength, FORWARD_BUFFER_SEC),
-        maxMaxBufferLength: enforceMinNumber(baseConfig.maxMaxBufferLength, MAX_MAX_BUFFER_SEC),
+        maxMaxBufferLength: Math.max(enforceMinNumber(baseConfig.maxMaxBufferLength, MAX_MAX_BUFFER_SEC),
+          enforceMinNumber(baseConfig.maxBufferLength, FORWARD_BUFFER_SEC)),
         maxBufferSize: enforceMinNumber(baseConfig.maxBufferSize, MSE_BUFFER_BYTES),
         startFragPrefetch: true,
         backBufferLength: enforceMinNumber(baseConfig.backBufferLength, BACK_BUFFER_SEC)
@@ -488,15 +503,78 @@
       diagnose('cache-hit',null,{bytes:entry.bytes});
       return cloneAB(entry.buffer);
     }
-    function lruSet(key, buffer, session) {
+    function bufferedResource(session, key) {
+      const span = session.bufferedResources.get(key), ranges = session.hls?.media?.buffered;
+      if (!span || !ranges) return false;
+      // Demuxed timestamps can differ from playlist boundaries by one frame.
+      for (let i=0;i<ranges.length;i++) {
+        if (ranges.start(i) <= span.start + 0.1 && ranges.end(i) >= span.end - 0.1) return true;
+      }
+      session.bufferedResources.delete(key);
+      return false;
+    }
+    function protectedCache(key, entry) {
+      for (const session of sessions) {
+        const w = session.window;
+        if (!session.disposed && session.hls?.media && session.scope === entry.scope && w &&
+            entry.level === w.level && entry.end > w.start && entry.start < w.end && !bufferedResource(session,key)) return true;
+      }
+      return false;
+    }
+    function reservedBytes(except) {
+      let bytes = 0;
+      for (const entry of inflightMap.values()) if (entry !== except) bytes += entry.reserved;
+      return bytes;
+    }
+    function makeCacheRoom(bytes, except, replacingKey, session, context, commit = false) {
+      if (bytes > MAX_MEM_BYTES) return false;
+      let needed = prebufBytes - (prebuf.get(replacingKey)?.bytes || 0) + reservedBytes(except) + bytes - MAX_MEM_BYTES;
+      if (needed <= 0) return true;
+      const candidates=[];
+      for (const [key,entry] of prebuf) {
+        if (key === replacingKey) continue;
+        const farther = session?.scope === entry.scope && context?.frag.level === entry.level && context.frag.start < entry.start;
+        if (protectedCache(key,entry) && !farther) continue;
+        let rank=1;
+        for (const owner of sessions) {
+          if (owner.scope !== entry.scope || !owner.window) continue;
+          const w=owner.window;
+          if (entry.end <= w.start) { rank=0; break; }
+          if (entry.level === w.level && entry.start < w.end && entry.end > w.start) rank=bufferedResource(owner,key) ? 2 : 3;
+        }
+        candidates.push({key,entry,rank});
+      }
+      candidates.sort((a,b)=>a.rank-b.rank || (a.rank===3 ? b.entry.start-a.entry.start : 0));
+      const victims=[];
+      for (const candidate of candidates) {
+        victims.push(candidate.key); needed-=candidate.entry.bytes;
+        if (needed<=0) {
+          // Admission only reserves reclaimable space. Failed requests never
+          // discard completed resources; successful writes commit atomically.
+          if (commit) for (const key of victims) deleteCache(key,'capacity');
+          return true;
+        }
+      }
+      return false;
+    }
+    function lruSet(key, buffer, session, context, pending) {
       const bytes = abSize(buffer);
-      if (!ENABLE_MEMCACHE || !bytes || bytes > MAX_MEM_BYTES || session.disposed) return;
+      if (!ENABLE_MEMCACHE || !bytes || session.disposed) return false;
+      if (!makeCacheRoom(bytes,pending,key,session,context)) {
+        session.requiredBytes.set(key,{bytes,start:context.frag.start,end:context.frag.start + context.frag.duration});
+        diagnose('capacity-blocked',session,{bytes});
+        return false;
+      }
       const copy = cloneAB(buffer);
-      if (!copy) return;
+      if (!copy) return false;
+      makeCacheRoom(bytes,pending,key,session,context,true);
       deleteCache(key);
       const [,playlist,identity] = JSON.parse(key);
-      prebuf.set(key, { buffer: copy, bytes, scope:session.scope, playlist,identity,used: false }); prebufBytes += bytes;
-      while (prebufBytes > MAX_MEM_BYTES) deleteCache(prebuf.keys().next().value,'capacity');
+      const frag = context.frag;
+      prebuf.set(key, { buffer: copy, bytes, scope:session.scope, playlist,identity,used: false,
+        level:frag.level,start:frag.start,end:frag.start + frag.duration }); prebufBytes += bytes;
+      session.requiredBytes.delete(key);
+      return true;
     }
     function fragmentRange(context) {
       const frag = context.frag || context;
@@ -524,7 +602,8 @@
         init ? [init.url,initRange.start,initRange.end] : null]);
     }
     function cancelTasks(session, reason) {
-      session.epoch++; session.queue = []; session.index = null;
+      session.epoch++; session.queue = [];
+      session.window = null; session.requiredBytes.clear(); clearTimeout(session.retryTimer);
       for (const entry of inflightMap.values()) if (entry.session === session) entry.cancel();
       diagnose(reason,session);
     }
@@ -544,6 +623,7 @@
       if (!source) return null;
       if (!session.scope || session.scope.source !== source || contract.some((v,i)=>v !== session.contract?.[i])) {
         cancelTasks(session,'resource-context-changed');
+        session.bufferedResources.clear();
         invalidateScope(session.scope,'resource-context-changed');
         session.catalog.clear(); session.contract = contract;
         session.scope = {id:++resourceSequence,source,playlists:new Map(),expires:0,
@@ -651,9 +731,16 @@
         this.stats.aborted = false;
         let phase = 'waiting', completeProgress = null;
         const key = resourceKey(this.session, context), scope = this.session.scope;
+        const demand = {key,generation};
+        this.session.demands.set(this,demand);
+        const release = () => {
+          if (this.session.demands.get(this) === demand) this.session.demands.delete(this);
+          this.session.schedule?.();
+        };
         this.cancelLoad = () => {
           if (phase === 'done') return;
           phase = 'done'; completeProgress = null;
+          release();
           callbacks.onAbort?.(this.stats, context, null);
         };
         const valid = () => generation === this.generation && phase !== 'done';
@@ -663,10 +750,11 @@
             const response = args[0]?.data;
             const data = completeResponse(context,response,args[3]) ? response :
               (response === completeProgress?.original && isDetached(response) ? completeProgress.copy : null);
-            if (completeResponse(context,data,args[3])) lruSet(key,data,this.session);
+            if (completeResponse(context,data,args[3])) lruSet(key,data,this.session,context);
           }
           completeProgress = null;
           phase = 'done'; clearTimeout(this.waitTimer);
+          release();
           if (this.inner.stats) this.stats = this.inner.stats;
           callbacks[name]?.(...args);
         };
@@ -678,6 +766,7 @@
             parsing: { start: 0, end: 0 }, buffering: { start: 0, first: 0, end: 0 },
             trequest: now, tfirst: now, tload: now });
           phase = 'done'; clearTimeout(this.waitTimer);
+          release();
           callbacks.onProgress?.(this.stats, context, cloneAB(buffer), null);
           if (generation === this.generation) callbacks.onSuccess?.({url:context.url, data:buffer}, this.stats, context, null);
         };
@@ -707,7 +796,7 @@
             this.waitTimer = setTimeout(goInner, WAIT_INFLIGHT_MS);
             pending.promise.then(buffer => {
               if (!valid() || phase !== 'waiting') return;
-              const copy = buffer && lruGet(key);
+              const copy = buffer && scope === this.session.scope && resourceKey(this.session,context) === key && (lruGet(key) || cloneAB(buffer));
               if (copy) deliver(copy); else goInner();
             }, goInner);
             return;
@@ -794,7 +883,8 @@
       const key = resourceKey(session, context), origin = new URL(context.url, location.href).origin;
       const pendingKey = requestKey(session,key);
       if (!key || inflightMap.has(pendingKey) || prebuf.has(key)) return;
-      const entry = { session, context, key, origin, epoch:session.epoch, cancelled:false, stopTransport:null };
+      const entry = { session, context, key, origin, epoch:session.epoch, cancelled:false, stopTransport:null,
+        reserved:session.requiredBytes.get(key)?.bytes || session.estimate };
       let resolve;
       entry.promise = new Promise(r => { resolve = r; });
       entry.cancel = () => { entry.cancelled = true; entry.stopTransport?.(); };
@@ -817,9 +907,13 @@
           if (!entry.cancelled && entry.epoch === session.epoch && !session.disposed && resourceKey(session,context) === key) {
             if (result) {
               metrics.downloadedBytes += result.byteLength;
-              lruSet(key, result, session);
+              const stored = lruSet(key, result, session, context, entry);
+              if (!stored && !session.requiredBytes.has(key)) {
+                recentFailMap.set(pendingKey,performance.now() + FAIL_TTL_MS);
+                diagnose('cache-copy-failed',session);
+              }
               originFailCount.delete(origin); originBanUntil.delete(origin);
-              session.estimate = session.estimate * 0.75 + result.byteLength * 0.25;
+              session.estimate = Math.max(result.byteLength,session.estimate * 0.75 + result.byteLength * 0.25);
             } else {
               recentFailMap.set(pendingKey, performance.now() + FAIL_TTL_MS);
               const count = (originFailCount.get(origin) || 0) + 1;
@@ -834,12 +928,16 @@
               if (session.goodSamples >= 8) { session.limit = Math.min(PREFETCH_CONC_GLOBAL,session.limit + 1); session.goodSamples = 0; }
             }
           } else { result = null; metrics.cancelled++; }
-        } catch { result = null; }
+        } catch {
+          result = null; recentFailMap.set(pendingKey,performance.now() + FAIL_TTL_MS);
+          diagnose('prefetch-error',session);
+        }
         finally {
           if (inflightMap.get(pendingKey) === entry) inflightMap.delete(pendingKey);
           const slots = (originSlots.get(origin) || 1) - 1;
           if (slots) originSlots.set(origin,slots); else originSlots.delete(origin);
-          resolve(result); sweepPenalties(); queueMicrotask(pumpPrefetch);
+          resolve(result); sweepPenalties();
+          for (const current of sessions) current.schedule?.();
         }
       })();
     }
@@ -851,22 +949,29 @@
         while (progress && inflightMap.size < PREFETCH_CONC_GLOBAL) {
           progress = false;
           for (const session of sessions) {
-            if (session.disposed || !session.queue.length || inflightMap.size >= PREFETCH_CONC_GLOBAL) continue;
+            if (session.disposed || !session.hls?.media || !session.queue.length || inflightMap.size >= PREFETCH_CONC_GLOBAL) continue;
+            if (session.demands.size) { session.stopReason = 'playback-request'; continue; }
             if (RUNTIME_CONFIG.adaptivePrefetch && navigator.connection?.saveData) continue;
             const active = [...inflightMap.values()].filter(e => e.session === session).length;
             if (active >= session.limit) continue;
-            // Estimate only; downloaded responses and MSE are additional memory.
-            const reserved = [...inflightMap.values()].reduce((n,e) => n + e.session.estimate,0);
-            if (reserved + session.estimate > MAX_MEM_BYTES) continue;
-            const index = session.queue.findIndex(context => {
-              const origin = new URL(context.url, location.href).origin;
-              return (originSlots.get(origin) || 0) < PREFETCH_CONC_PER_ORIGIN && !(originBanUntil.get(origin) > performance.now());
-            });
-            if (index < 0) continue;
-            const context = session.queue.splice(index,1)[0], key = resourceKey(session,context);
-            progress = true;
+            const context = session.queue[0], key = resourceKey(session,context);
             const pendingKey = requestKey(session,key);
-            if (!key || prebuf.has(key) || inflightMap.has(pendingKey) || recentFailMap.get(pendingKey) > performance.now()) continue;
+            if (!key || prebuf.has(key) || bufferedResource(session,key) || inflightMap.has(pendingKey)) {
+              session.queue.shift(); progress = true; continue;
+            }
+            const origin = new URL(context.url,location.href).origin;
+            if ((originSlots.get(origin) || 0) >= PREFETCH_CONC_PER_ORIGIN) continue;
+            const retryAt = Math.max(recentFailMap.get(pendingKey) || 0,originBanUntil.get(origin) || 0);
+            if (retryAt > performance.now()) {
+              session.stopReason = 'request-backoff';
+              clearTimeout(session.retryTimer);
+              session.retryTimer = setTimeout(()=>session.schedule?.(),retryAt-performance.now()+1);
+              continue;
+            }
+            if (!makeCacheRoom(session.requiredBytes.get(key)?.bytes || session.estimate,null,null,session,context)) {
+              session.stopReason = 'capacity'; continue;
+            }
+            session.queue.shift(); progress = true; session.stopReason = 'downloading';
             startPrefetch(session,context);
           }
         }
@@ -876,75 +981,130 @@
       sessions.add(session); session.hls = hls;
       const listeners = [];
       const on = (event, fn) => { if (event) { hls.on(event,fn); listeners.push([event,fn]); } };
-      let media;
-      const seeking = () => { cancelTasks(session,'seek'); session.schedule?.(); };
-      const bindMedia = () => {
-        media?.removeEventListener('seeking',seeking); media = hls.media;
-        if (media) session.lastMediaRef = session.mediaRef = new WeakRef(media);
-        ensureScope(session);
-        media?.addEventListener('seeking',seeking);
+      let media, scheduled = false;
+      const contextFor = frag => {
+        let url;
+        try { url = frag.url; } catch { return null; }
+        const range = fragmentRange(frag);
+        if (!url || !range || frag.gap) return null;
+        const context = {url,responseType:'arraybuffer',type:'fragment',frag,part:null};
+        if (range.start !== null) { context.rangeStart=range.start; context.rangeEnd=range.end; }
+        return context;
       };
-      // The element identity is known at ATTACHING, before sourceopen. A caller
-      // may start loading in that interval, so establish ownership immediately.
-      on(Ev.MEDIA_ATTACHING,bindMedia); on(Ev.MEDIA_ATTACHED,bindMedia); bindMedia();
-      on(Ev.MEDIA_DETACHING,() => {
-        media?.removeEventListener('seeking',seeking); media=null; session.mediaRef=null;
-        cancelTasks(session,'media-detached');
-      });
-      on(Ev.MANIFEST_LOADING,(_event,data) => {
-        cancelTasks(session,'manifest-loading'); session.source = hls.url || data?.url;
-        session.staleDetails = new WeakSet([...session.catalog.values()].map(item=>item.details));
-        session.manifestPending = true; session.catalog.clear(); ensureScope(session);
-      });
-      on(Ev.MANIFEST_PARSED,() => { session.manifestPending = false; });
-      on(Ev.LEVEL_LOADED,(_event,data) => {
-        session.manifestPending = false; confirmPlaylist(session,data.level,data.details);
-      });
-      on(Ev.LEVEL_SWITCHING,() => cancelTasks(session,'level-switch'));
-      on(Ev.DESTROYING,() => disposeSession(session));
-      session.detach = () => {
-        media?.removeEventListener('seeking',seeking); media = null;
-        for (const [event,fn] of listeners) hls.off?.(event,fn);
-        listeners.length = 0;
-      };
-      const schedule = (_event,data) => {
-        const frag = data?.frag;
-        if (session.disposed || !media || pageSuspended) return;
-        if (!frag || !['main','video'].includes(frag.type || 'main')) return;
-        const details = hls.levels?.[frag.level]?.details;
-        if (!Array.isArray(details?.fragments)) return;
-        const fragments = details.fragments;
-        if (!session.index || session.index.details !== details || session.index.fragments !== fragments || session.index.length !== fragments.length || session.index.first !== fragments[0]?.sn || session.index.last !== fragments.at(-1)?.sn) {
-          session.index = { details,fragments,length:fragments.length,first:fragments[0]?.sn,last:fragments.at(-1)?.sn,map:new Map(fragments.map((f,i)=>[f.sn,i])) };
-        }
-        const index = session.index.map.get(frag.sn);
-        if (index === undefined) return;
-        for (const entry of inflightMap.values()) if (entry.session === session && entry.context.frag.level === frag.level && entry.context.frag.sn < frag.sn) entry.cancel();
+      const refresh = () => {
         session.queue = [];
-        if (!ENABLE_PREFETCH || !ENABLE_MEMCACHE) return;
-        let seconds = 0;
-        const horizon = RUNTIME_CONFIG.adaptivePrefetch && details.live ? Math.min(12,RUNTIME_CONFIG.prefetchSeconds) : RUNTIME_CONFIG.prefetchSeconds;
-        for (const nf of fragments.slice(index+1,index+1+PREFETCH_AHEAD)) {
-          if (nf.gap) continue;
-          if (seconds >= horizon) break;
-          seconds += Number(nf.duration) || 0;
-          let url;
-          try { url = nf.url; } catch { continue; }
-          if (!url) continue;
-          const range = fragmentRange(nf);
-          if (!range) continue;
-          const context = {url,responseType:'arraybuffer',type:'fragment',frag:nf,part:null};
-          if (range.start !== null) { context.rangeStart=range.start; context.rangeEnd=range.end; }
+        if (session.disposed || !media || pageSuspended) { session.stopReason='detached'; return; }
+        if (!ENABLE_PREFETCH || !ENABLE_MEMCACHE || !PREFETCH_AHEAD) { session.stopReason='disabled'; return; }
+        if (RUNTIME_CONFIG.adaptivePrefetch && navigator.connection?.saveData) { session.stopReason='save-data'; return; }
+        const level = hls.loadLevel >= 0 ? hls.loadLevel : hls.currentLevel;
+        const details = hls.levels?.[level]?.details;
+        if (session.manifestPending || !Array.isArray(details?.fragments) || session.staleDetails?.has(details)) {
+          session.stopReason='playlist-unconfirmed'; return;
+        }
+        const fragments = details.fragments, start = media.currentTime;
+        const horizon = details.live ? (RUNTIME_CONFIG.adaptivePrefetch ? Math.min(12,RUNTIME_CONFIG.prefetchSeconds) : RUNTIME_CONFIG.prefetchSeconds) : TARGET_SECONDS;
+        session.targetSeconds = horizon;
+        const end = Math.min(start + horizon, fragments.length ? fragments.at(-1).start + fragments.at(-1).duration : start);
+        // Confirm the scope before publishing the window: identity changes cancel tasks.
+        ensureScope(session);
+        session.window = {level,start,end};
+        session.stopReason = 'target-covered';
+        for (const [key] of session.bufferedResources) bufferedResource(session,key);
+        for (const entry of inflightMap.values()) {
+          const f = entry.context.frag;
+          if (entry.session === session && (f.level !== level || f.start + f.duration <= start || f.start >= end)) entry.cancel();
+        }
+        for (const [key,required] of session.requiredBytes) {
+          const identity = JSON.parse(key)[2];
+          if (required.end <= start || required.start >= end || !session.catalog.get(level)?.record.members.has(identity)) session.requiredBytes.delete(key);
+        }
+        // Fragments are ordered by presentation time. Search the window start,
+        // then build only one batch of missing resources, not a second cache.
+        let low=0, high=fragments.length;
+        while (low<high) {
+          const mid=(low+high)>>>1, f=fragments[mid];
+          if (f.start+f.duration <= start) low=mid+1; else high=mid;
+        }
+        for (let i=low;i<fragments.length && fragments[i].start<end;i++) {
+          const context = contextFor(fragments[i]);
+          if (!context) continue;
+          const key = resourceKey(session,context);
+          if (!key) { session.stopReason='unsupported-resource'; continue; }
+          const cached=prebuf.get(key);
+          if (cached) {
+            // Hls.js refines the presentation timeline after demuxing. Keep
+            // coverage metadata current without changing resource identity.
+            cached.start=context.frag.start; cached.end=cached.start+context.frag.duration;
+            continue;
+          }
+          if (bufferedResource(session,key)) continue;
+          if (inflightMap.has(requestKey(session,key))) { session.stopReason='downloading'; continue; }
           session.queue.push(context);
+          session.stopReason='queued';
+          if (session.queue.length >= PREFETCH_AHEAD) break;
         }
         pumpPrefetch();
       };
       session.schedule = () => {
-        const level = hls.loadLevel >= 0 ? hls.loadLevel : hls.currentLevel;
-        const frag = hls.levels?.[level]?.details?.fragments?.find(f=>f.start <= media?.currentTime && f.start + f.duration > media.currentTime);
-        if (frag) schedule(null,{frag});
+        if (scheduled || session.disposed) return;
+        scheduled = true;
+        queueMicrotask(() => { scheduled=false; refresh(); });
       };
-      on(Ev.FRAG_LOADING,schedule); on(Ev.FRAG_LOADED,schedule);
+      const seeking = () => { cancelTasks(session,'seek'); session.schedule(); };
+      const unbind = () => {
+        media?.removeEventListener('seeking',seeking);
+        media?.removeEventListener('timeupdate',session.schedule);
+        session.bufferedResources.clear();
+      };
+      const bindMedia = () => {
+        if (media !== hls.media) { unbind(); media = hls.media; }
+        if (media) session.lastMediaRef = session.mediaRef = new WeakRef(media);
+        ensureScope(session);
+        media?.addEventListener('seeking',seeking);
+        media?.addEventListener('timeupdate',session.schedule);
+        session.schedule();
+      };
+      on(Ev.MEDIA_ATTACHING,bindMedia); on(Ev.MEDIA_ATTACHED,bindMedia); bindMedia();
+      on(Ev.MEDIA_DETACHING,() => {
+        unbind(); media=null; session.mediaRef=null; cancelTasks(session,'media-detached');
+      });
+      on(Ev.MANIFEST_LOADING,(_event,data) => {
+        cancelTasks(session,'manifest-loading'); session.source = hls.url || data?.url;
+        session.bufferedResources.clear();
+        session.staleDetails = new WeakSet([...session.catalog.values()].map(item=>item.details));
+        session.manifestPending = true; session.catalog.clear(); ensureScope(session);
+      });
+      on(Ev.MANIFEST_PARSED,() => { session.manifestPending = false; session.schedule(); });
+      on(Ev.LEVEL_LOADED,(_event,data) => {
+        session.manifestPending = false; confirmPlaylist(session,data.level,data.details); session.schedule();
+      });
+      on(Ev.LEVEL_SWITCHING,() => { cancelTasks(session,'level-switch'); session.schedule(); });
+      on(Ev.FRAG_BUFFERED,(_event,data) => {
+        const context = data?.frag && contextFor(data.frag);
+        const key = context && !data.part && resourceKey(session,context);
+        if (key) {
+          const frag = data.frag, start=frag.start, end=start+frag.duration;
+          for (const [other,span] of session.bufferedResources) {
+            if (other !== key && span.start < end-0.1 && span.end > start+0.1) session.bufferedResources.delete(other);
+          }
+          session.bufferedResources.set(key,{start,end,level:frag.level});
+          session.requiredBytes.delete(key);
+        }
+        session.schedule();
+      });
+      on(Ev.BUFFER_FLUSHING,(_event,data) => {
+        for (const [key,span] of session.bufferedResources) {
+          if (span.start < data.endOffset && span.end > data.startOffset) session.bufferedResources.delete(key);
+        }
+      });
+      on(Ev.BUFFER_FLUSHED,session.schedule);
+      on(Ev.FRAG_LOADING,session.schedule); on(Ev.FRAG_LOADED,session.schedule);
+      on(Ev.DESTROYING,() => disposeSession(session));
+      session.detach = () => {
+        unbind(); media = null; clearTimeout(session.retryTimer);
+        for (const [event,fn] of listeners) hls.off?.(event,fn);
+        listeners.length = 0;
+      };
     }
     window.addEventListener('pagehide', () => {
       pageSuspended = true;
@@ -952,11 +1112,26 @@
       for (const scope of retiredScopes) invalidateScope(scope,'page-hidden');
     });
     window.addEventListener('pageshow', () => { pageSuspended = false; for (const session of sessions) session.schedule?.(); });
-    if (DEBUG) window.__STREAMBOOST_DIAGNOSTICS__ = () => ({...metrics,cacheBytes:prebufBytes,activeRequests:inflightMap.size,sessions:sessions.size,
+    function mergeRanges(spans) {
+      const out=[];
+      for (const span of spans.sort((a,b)=>a[0]-b[0])) {
+        const last=out.at(-1);
+        if (last && span[0] <= last[1]+0.05) last[1]=Math.max(last[1],span[1]);
+        else out.push([...span]);
+      }
+      return out;
+    }
+    if (DEBUG) window.__STREAMBOOST_DIAGNOSTICS__ = () => ({...metrics,cacheBytes:prebufBytes,reservedBytes:reservedBytes(),activeRequests:inflightMap.size,sessions:sessions.size,
       events:diagnosticEvents.map(e=>({...e})),retainedScopes:retiredScopes.size,
       players:[...sessions].map(s=>{
         const media = s.hls?.media, buffered = media?.buffered;
+        const cacheRanges = mergeRanges([...prebuf.values()].filter(e=>e.scope===s.scope && e.level===s.window?.level && Number.isFinite(e.start)).map(e=>[e.start,e.end]));
+        const confirmed = [...s.bufferedResources].filter(([key,span])=>span.level===s.window?.level && bufferedResource(s,key)).map(([,span])=>[span.start,span.end]);
+        const availableRanges = mergeRanges([...cacheRanges,...confirmed]);
+        const time=media?.currentTime ?? 0, continuous=availableRanges.find(r=>r[0]<=time+0.05 && r[1]>time);
         return {id:s.id,taskGeneration:s.epoch,queued:s.queue.length,resource:s.scope?.id ?? null,
+          targetSeconds:s.targetSeconds ?? TARGET_SECONDS,window:s.window ? {...s.window} : null,stopReason:s.stopReason,
+          cacheRanges,availableRanges,downloadedAheadSeconds:continuous ? continuous[1]-time : 0,
           attached:!!media,currentTime:media?.currentTime ?? null,level:s.hls?.currentLevel ?? null,
           buffered:buffered ? Array.from({length:buffered.length},(_,i)=>[buffered.start(i),buffered.end(i)]) : []};
       })});
@@ -991,7 +1166,7 @@
             const Loader = originalConfig.fLoader || originalConfig.loader;
             const session = {id:++sessionSequence,epoch:0,Loader,custom:!!(originalConfig.fLoader || userConfig.loader ||
               originalConfig.loader !== initialDefaultLoader),catalog:new Map(),
-              disposed:false,queue:[],index:null,estimate:2*1024*1024,limit:PREFETCH_CONC_GLOBAL,badSamples:0,goodSamples:0};
+              disposed:false,queue:[],demands:new Map(),bufferedResources:new Map(),requiredBytes:new Map(),estimate:2*1024*1024,limit:PREFETCH_CONC_GLOBAL,badSamples:0,goodSamples:0};
             if (ENABLE_MEMCACHE && typeof Loader === 'function') {
               enforced.fLoader = class extends CacheFirstFragLoader { constructor(cfg) { super(cfg,session); } };
             }
@@ -999,25 +1174,6 @@
             this.__streamboostSession = session;
             attachPrefetch(this,session,OriginalHls.Events);
             window.__HLS_BIGBUF_LAST__ = this;
-            try {
-              this.on(OriginalHls.Events.LEVEL_LOADED, (_evt, data) => {
-                const isLive = !!data?.details?.live;
-                if (!isLive) {
-                  const c = this.config;
-                  Object.assign(c, buildHlsBufferConfig(c));
-                  log('LEVEL_LOADED → ensured on-demand HLS buffer targets', {
-                    maxBufferLength: c.maxBufferLength,
-                    maxMaxBufferLength: c.maxMaxBufferLength,
-                    maxBufferSize: c.maxBufferSize,
-                    backBufferLength: c.backBufferLength,
-                    startFragPrefetch: c.startFragPrefetch
-                  });
-                } else {
-                  log('LEVEL_LOADED (live) → HLS buffer targets remain active; live-sync settings unchanged');
-                }
-              });
-            } catch {}
-
             log('Hls instance created', {prefetch:ENABLE_PREFETCH,memcache:ENABLE_MEMCACHE});
           }
           destroy() {

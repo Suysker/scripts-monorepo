@@ -101,6 +101,8 @@
 3. 在需要加速播放或精确跳转视频时按住右键（→）或左键（←），轻松控制视频播放。
 4. 当遇到冗长片段或广告时，可以**同时按下左右键（← + →）** 快进视频，快速跳过不必要的内容。
 
+**播放本地影片：** 在 Chrome 或 Edge 的扩展管理页面，打开 Tampermonkey 的详细信息，开启“允许访问文件网址”，再将 MP4 等浏览器支持的影片拖入浏览器播放。脚本已包含本地文件匹配规则；影片直接从本地读取，无需上传。该功能不适用于 PotPlayer、VLC 等独立播放器。
+
 脚本源码地址（Raw）：
 `https://raw.githubusercontent.com/Suysker/scripts-monorepo/main/Golden-Left-Right/Golden-Left-Right.js`
 
