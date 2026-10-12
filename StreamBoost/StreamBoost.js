@@ -1,10 +1,12 @@
 ﻿// ==UserScript==
 // @name         流媒体加速缓冲
+// @name:en      StreamBoost — Video Buffer Booster
 // @namespace    streamboost
 // @icon         https://image.suysker.xyz/i/2023/10/09/artworks-QOnSW1HR08BDMoe9-GJTeew-t500x500.webp
 // @namespace    http://tampermonkey.net/
 // @version      1.5.0
 // @description  通用流媒体加速：加大缓冲、并发预取、内存命中、在途合并、按站点启停、修复部分站点自定义 Loader 导致的串行；当前覆盖 HLS.js，后续可扩展至其它播放器/协议。
+// @description:en Improve Hls.js buffering with parallel prefetching, reusable segment caching, global settings and per-site controls while keeping the original player.
 // @match        *://*/*
 // @run-at       document-start
 // @grant        GM_registerMenuCommand
@@ -18,6 +20,68 @@
   'use strict';
   const SETTINGS_STORAGE_KEY = 'streamboost.settings';
   const SETTINGS_SCHEMA_VERSION = 2;
+  // Chinese source messages and one English catalog share the same UI and settings.
+  const EN = Object.freeze({
+    '预取并发': 'Prefetching',
+    '缓冲与内存': 'Buffering and memory',
+    '请求策略+常规开关': 'Requests and switches',
+    '预取目标（秒）': 'Prefetch target (seconds)',
+    '实验性自适应预取（含省流量/直播策略）': 'Adaptive prefetching (experimental; data saver and live streams)',
+    'MSE 缓冲目标（至少，MB）': 'Player buffer target (MSE, minimum MB)',
+    '每批预取片段数（0 为关闭）': 'Segments per batch (0 disables prefetching)',
+    '页面总预取并发上限': 'Page prefetch concurrency limit',
+    '单资源 Origin 并发上限': 'Per-origin prefetch limit',
+    '在途复用等待（ms）': 'Wait for an in-flight download (ms)',
+    '前向目标（秒）': 'Forward buffer target (seconds)',
+    '回看目标（至少，秒）': 'Back buffer target (minimum seconds)',
+    '最大缓冲目标（秒）': 'Maximum buffer target (seconds)',
+    '缓存参考容量（MB，可超出）': 'Cache reference size (MB; may be exceeded)',
+    '并发预取': 'Parallel prefetching',
+    '内存命中 fLoader': 'Memory cache (fLoader)',
+    '预取超时（ms）': 'Prefetch timeout (ms)',
+    '预取策略': 'Prefetch strategy',
+    'xhr-hls-fetch（推荐）': 'xhr-hls-fetch (recommended)',
+    '界面语言 / Language': 'Language / 界面语言',
+    '跟随浏览器': 'Follow browser',
+    '⚙️ StreamBoost 全局参数': '⚙️ StreamBoost global settings',
+    '作用于脚本匹配的所有网站与播放器 iframe；保存后刷新已打开页面生效。': 'Applies to all matching sites and player frames. Save, then reload open pages to apply.',
+    '关闭': 'Close', '恢复默认': 'Reset defaults', '保存全局配置': 'Save global settings',
+    '启用': 'Enabled', '停用': 'Disabled',
+    '配置版本 {version} 高于当前脚本支持的版本 {supported}': 'Settings version {version} is newer than supported version {supported}',
+    '无法读取脚本全局配置：{error}': 'Could not read global settings: {error}',
+    '无法写入脚本全局配置：{error}': 'Could not write global settings: {error}',
+    '缺少配置控件：{field}': 'Missing settings control: {field}',
+    '{field} 必须是数字': '{field} must be a number',
+    '{field} 取值无效': 'Invalid value for {field}',
+    '不支持的字段类型': 'Unsupported field type',
+    '页面尚未加载完成，请稍后重试。': 'The page is not ready yet. Please try again shortly.',
+    '无法打开配置：{error}': 'Could not open settings: {error}',
+    '全局配置已保存；请刷新已打开的播放页面。': 'Global settings saved. Reload open playback pages to apply.',
+    '保存失败：{error}': 'Could not save settings: {error}',
+    '更新失败：{error}': 'Could not update settings: {error}',
+    '🔌 全局状态（当前：{state}）': '🔌 Global status: {state}',
+    '全局状态：{state}；请刷新已打开页面': 'Global status: {state}. Reload open pages to apply.',
+    '✅ 移除当前主机名停用规则（{host}）': '✅ Remove disable rules for this host ({host})',
+    '⛔ 停用当前主机名（{host}）': '⛔ Disable on this host ({host})',
+    '当前主机名由通配规则 {rules} 停用。\n移除后也会影响这些规则覆盖的其他主机名，是否继续？': 'This host is disabled by wildcard rules: {rules}.\nRemoving them also affects other matching hosts. Continue?',
+    '已移除确认的当前主机名停用规则：{host}': 'Removed the confirmed disable rules for: {host}',
+    '当前主机名仍被其他新规则停用': 'This host is still disabled by other new rules.',
+    '全局开关仍处于停用状态': 'StreamBoost is still disabled globally.',
+    '请刷新页面': 'Reload the page to apply.',
+    '已停用当前主机名：{host}': 'Disabled on this host: {host}',
+    '当前主机名已由其他规则停用：{host}': 'This host is already disabled by another rule: {host}',
+    '⚙️ 打开参数配置页': '⚙️ Open settings',
+    '🐞 Debug 日志（当前：{state}）': '🐞 Debug logging: {state}',
+    'Debug 日志：{state}；请刷新已打开页面': 'Debug logging: {state}. Reload open pages to apply.'
+  });
+  let uiLanguage = 'auto';
+  function resolvedLanguage() {
+    return uiLanguage === 'auto' ? (/^zh(?:-|$)/i.test(navigator.language || '') ? 'zh' : 'en') : uiLanguage;
+  }
+  function t(message, values = {}) {
+    const text = resolvedLanguage() === 'en' ? (EN[message] ?? message) : message;
+    return text.replace(/\{(\w+)\}/g, (match, key) => values[key] ?? match);
+  }
   const DEFAULT_DEVICE_MEMORY_GB = 4;
   const deviceMemoryGb = Number.isFinite(Number(navigator.deviceMemory))
     ? Number(navigator.deviceMemory)
@@ -119,6 +183,7 @@
       schemaVersion: SETTINGS_SCHEMA_VERSION,
       globalEnabled: true,
       debugEnabled: false,
+      language: 'auto',
       disabledHostPatterns: [],
       runtime: createDefaultRuntimeConfig()
     };
@@ -130,6 +195,7 @@
       schemaVersion: SETTINGS_SCHEMA_VERSION,
       globalEnabled: source.globalEnabled == null ? defaults.globalEnabled : normalizeFieldValue(source.globalEnabled, { type: 'bool', def: defaults.globalEnabled }),
       debugEnabled: source.debugEnabled == null ? defaults.debugEnabled : normalizeFieldValue(source.debugEnabled, { type: 'bool', def: defaults.debugEnabled }),
+      language: ['auto', 'zh', 'en'].includes(source.language) ? source.language : defaults.language,
       disabledHostPatterns: normalizeHostPatterns(source.disabledHostPatterns),
       runtime: normalizeRuntimeConfig(source.runtime, Number(source.schemaVersion) || 1)
     };
@@ -137,16 +203,18 @@
   function assertSupportedSchema(candidate) {
     const version = Number(isRecord(candidate) ? candidate.schemaVersion : 0);
     if (Number.isFinite(version) && version > SETTINGS_SCHEMA_VERSION) {
-      throw new Error(`配置版本 ${version} 高于当前脚本支持的版本 ${SETTINGS_SCHEMA_VERSION}`);
+      throw new Error(t('配置版本 {version} 高于当前脚本支持的版本 {supported}', {version, supported: SETTINGS_SCHEMA_VERSION}));
     }
   }
   function loadSettings() {
     try {
       const stored = GM_getValue(SETTINGS_STORAGE_KEY, null);
       assertSupportedSchema(stored);
-      return normalizeSettings(stored);
+      const settings = normalizeSettings(stored);
+      uiLanguage = settings.language;
+      return settings;
     } catch (error) {
-      throw new Error(`无法读取脚本全局配置：${error?.message || error}`);
+      throw new Error(t('无法读取脚本全局配置：{error}', {error: error?.message || error}));
     }
   }
   function saveSettings(candidate) {
@@ -156,16 +224,16 @@
       GM_setValue(SETTINGS_STORAGE_KEY, normalized);
       return normalized;
     } catch (error) {
-      throw new Error(`无法写入脚本全局配置：${error?.message || error}`);
+      throw new Error(t('无法写入脚本全局配置：{error}', {error: error?.message || error}));
     }
   }
   function updateSettings(mutator) {
     const current = loadSettings();
     return saveSettings(mutator(current));
   }
-  function updateRuntimeConfig(runtime) {
+  function updateRuntimeConfig(runtime, language) {
     const normalizedRuntime = normalizeRuntimeConfig(runtime);
-    return updateSettings(current => ({ ...current, runtime: normalizedRuntime }));
+    return updateSettings(current => ({ ...current, runtime: normalizedRuntime, language }));
   }
   function isHostDisabled(host, settings) {
     return settings.disabledHostPatterns.some(pattern => hostMatches(host, pattern));
@@ -192,7 +260,7 @@
     try {
       return loadSettings();
     } catch (error) {
-      console.warn('[HLS BigBuffer] 配置读取失败，本页为安全起见不注入', error);
+      console.warn('[HLS BigBuffer] Settings read failed; skipping injection on this page', error);
       return { ...createDefaultSettings(), globalEnabled: false };
     }
   }
@@ -202,7 +270,7 @@
     if (document.getElementById(SB_CFG_STYLE_ID)) return;
     const style = document.createElement('style');
     style.id = SB_CFG_STYLE_ID;
-    style.textContent = `#${SB_CFG_MODAL_ID}{position:fixed;inset:0;z-index:2147483647;background:radial-gradient(1200px 520px at 8% -6%,rgba(255,212,229,.38),transparent 66%),radial-gradient(980px 520px at 100% 100%,rgba(233,232,236,.44),transparent 67%),rgba(245,240,243,.74);display:flex;align-items:center;justify-content:center;font:12px/1.3 "Segoe UI","PingFang SC","Microsoft YaHei",sans-serif;color:#4a4350}#${SB_CFG_MODAL_ID} .panel{width:min(1260px,96vw);max-height:min(92vh,760px);display:grid;grid-template-rows:auto auto;gap:10px;padding:14px;border-radius:20px;border:1px solid #f0d6e2;background:linear-gradient(145deg,rgba(255,255,255,.96),rgba(244,238,242,.95));box-shadow:0 16px 40px rgba(104,88,99,.22),inset 0 1px 0 rgba(255,255,255,.9)}#${SB_CFG_MODAL_ID} h2{margin:0;font-size:22px;color:#544a56}#${SB_CFG_MODAL_ID} .head{display:flex;justify-content:space-between;align-items:flex-start;gap:10px;flex-wrap:wrap}#${SB_CFG_MODAL_ID} .hint{margin:4px 0 0;color:#7b6f7c}#${SB_CFG_MODAL_ID} .layout{display:grid;grid-template-columns:1fr;gap:8px}#${SB_CFG_MODAL_ID} .sections{display:grid;grid-template-columns:repeat(3,minmax(220px,1fr));gap:8px}#${SB_CFG_MODAL_ID} .group{background:linear-gradient(150deg,rgba(255,255,255,.98),rgba(247,242,245,.96));border:1px solid #ecdde6;border-radius:12px;padding:8px}#${SB_CFG_MODAL_ID} .group h3{margin:0 0 6px;font-size:13px;color:#5f5462}#${SB_CFG_MODAL_ID} .group-grid{display:grid;grid-template-columns:1fr;gap:6px}#${SB_CFG_MODAL_ID} .field{background:#fff;border:1px solid #efe4eb;border-radius:10px;padding:7px;box-shadow:inset 0 1px 0 rgba(255,255,255,.9)}#${SB_CFG_MODAL_ID} .title{font-size:11px;color:#5f5463;margin-bottom:5px}#${SB_CFG_MODAL_ID} .num{display:grid;grid-template-columns:1fr 72px;gap:6px;align-items:center}#${SB_CFG_MODAL_ID} input[type=number]{width:100%;box-sizing:border-box;border:1px solid #dcced7;border-radius:7px;padding:5px 6px;font-size:12px;color:#4a4150;background:#fefcfd;text-align:center}#${SB_CFG_MODAL_ID} input[type=range]{width:100%;accent-color:#d88cae}#${SB_CFG_MODAL_ID} .chips{display:flex;gap:5px;flex-wrap:wrap}#${SB_CFG_MODAL_ID} .chip{border:1px solid #dcc6d2;background:#f8f3f6;color:#5f5562;border-radius:999px;padding:4px 7px;cursor:pointer;font-size:11px}#${SB_CFG_MODAL_ID} .chip.on{background:linear-gradient(135deg,#f6cde0,#f2b8d3);border-color:#df99bc;color:#4d3544}#${SB_CFG_MODAL_ID} .actions{display:flex;justify-content:flex-end;gap:8px}#${SB_CFG_MODAL_ID} .head .actions{margin-left:auto}#${SB_CFG_MODAL_ID} button{border:1px solid #dccad5;border-radius:9px;padding:7px 12px;cursor:pointer;font-weight:700;color:#5d4f60;background:#faf6f8}#${SB_CFG_MODAL_ID} button.primary{background:linear-gradient(135deg,#f7d2e3,#f2bad4);border-color:#de9dbe;color:#4f3c49}#${SB_CFG_MODAL_ID} .switch{display:flex;gap:6px;flex-wrap:wrap}#${SB_CFG_MODAL_ID} .switch-btn{border:1px solid #dcc6d2;background:#f8f3f6;color:#5f5562;border-radius:999px;padding:4px 10px;cursor:pointer;font-size:11px}#${SB_CFG_MODAL_ID} .switch-btn.on{background:linear-gradient(135deg,#f6cde0,#f2b8d3);border-color:#df99bc;color:#4d3544}`;
+    style.textContent = `#${SB_CFG_MODAL_ID}{position:fixed;inset:0;z-index:2147483647;background:radial-gradient(1200px 520px at 8% -6%,rgba(255,212,229,.38),transparent 66%),radial-gradient(980px 520px at 100% 100%,rgba(233,232,236,.44),transparent 67%),rgba(245,240,243,.74);display:flex;align-items:center;justify-content:center;font:12px/1.3 "Segoe UI","PingFang SC","Microsoft YaHei",sans-serif;color:#4a4350}#${SB_CFG_MODAL_ID} .panel{width:min(1260px,96vw);max-height:min(92vh,760px);display:grid;grid-template-rows:auto auto minmax(0,1fr);box-sizing:border-box;gap:10px;padding:14px;border-radius:20px;border:1px solid #f0d6e2;background:linear-gradient(145deg,rgba(255,255,255,.96),rgba(244,238,242,.95));box-shadow:0 16px 40px rgba(104,88,99,.22),inset 0 1px 0 rgba(255,255,255,.9)}#${SB_CFG_MODAL_ID} h2{margin:0;font-size:22px;color:#544a56}#${SB_CFG_MODAL_ID} .head{display:flex;justify-content:space-between;align-items:flex-start;gap:10px;flex-wrap:wrap}#${SB_CFG_MODAL_ID} .hint{margin:4px 0 0;color:#7b6f7c}#${SB_CFG_MODAL_ID} .layout{display:grid;grid-template-columns:1fr;gap:8px;min-height:0;overflow:auto}#${SB_CFG_MODAL_ID} .sections{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,280px),1fr));gap:8px}#${SB_CFG_MODAL_ID} .group{background:linear-gradient(150deg,rgba(255,255,255,.98),rgba(247,242,245,.96));border:1px solid #ecdde6;border-radius:12px;padding:8px}#${SB_CFG_MODAL_ID} .group h3{margin:0 0 6px;font-size:13px;color:#5f5462}#${SB_CFG_MODAL_ID} .group-grid{display:grid;grid-template-columns:1fr;gap:6px}#${SB_CFG_MODAL_ID} .field{background:#fff;border:1px solid #efe4eb;border-radius:10px;padding:7px;box-shadow:inset 0 1px 0 rgba(255,255,255,.9)}#${SB_CFG_MODAL_ID} .title{font-size:11px;color:#5f5463;margin-bottom:5px}#${SB_CFG_MODAL_ID} .num{display:grid;grid-template-columns:1fr 72px;gap:6px;align-items:center}#${SB_CFG_MODAL_ID} input[type=number]{width:100%;box-sizing:border-box;border:1px solid #dcced7;border-radius:7px;padding:5px 6px;font-size:12px;color:#4a4150;background:#fefcfd;text-align:center}#${SB_CFG_MODAL_ID} input[type=range]{width:100%;accent-color:#d88cae}#${SB_CFG_MODAL_ID} .chips{display:flex;gap:5px;flex-wrap:wrap}#${SB_CFG_MODAL_ID} .chip{border:1px solid #dcc6d2;background:#f8f3f6;color:#5f5562;border-radius:999px;padding:4px 7px;cursor:pointer;font-size:11px}#${SB_CFG_MODAL_ID} .chip.on{background:linear-gradient(135deg,#f6cde0,#f2b8d3);border-color:#df99bc;color:#4d3544}#${SB_CFG_MODAL_ID} .actions{display:flex;justify-content:flex-end;gap:8px;flex-wrap:wrap}#${SB_CFG_MODAL_ID} .head .actions{margin-left:auto}#${SB_CFG_MODAL_ID} select{font:inherit;color:inherit;background:#fff;border:1px solid #dccad5;border-radius:7px;padding:5px 8px}#${SB_CFG_MODAL_ID} button{border:1px solid #dccad5;border-radius:9px;padding:7px 12px;cursor:pointer;font-weight:700;color:#5d4f60;background:#faf6f8}#${SB_CFG_MODAL_ID} button.primary{background:linear-gradient(135deg,#f7d2e3,#f2bad4);border-color:#de9dbe;color:#4f3c49}#${SB_CFG_MODAL_ID} .switch{display:flex;gap:6px;flex-wrap:wrap}#${SB_CFG_MODAL_ID} .switch-btn{border:1px solid #dcc6d2;background:#f8f3f6;color:#5f5562;border-radius:999px;padding:4px 10px;cursor:pointer;font-size:11px}#${SB_CFG_MODAL_ID} .switch-btn.on{background:linear-gradient(135deg,#f6cde0,#f2b8d3);border-color:#df99bc;color:#4d3544}`;
     (document.head || document.documentElement).appendChild(style);
   }
   function setFieldControlValue(field, input, value) {
@@ -218,7 +286,7 @@
     }
   }
   function collectFieldControlValue(field, input) {
-    if (!input) throw new Error(`缺少配置控件：${field.label}`);
+    if (!input) throw new Error(t('缺少配置控件：{field}', {field: t(field.label)}));
     if (field.type === 'bool') {
       const selected = input.buttons.find(button => button.classList.contains('on'));
       return String(selected?.dataset?.value || '0') === '1';
@@ -227,32 +295,35 @@
       const raw = String(input.num.value || '').trim();
       if (!raw) return field.def;
       const num = Number(raw);
-      if (!Number.isFinite(num)) throw new Error(`${field.label} 必须是数字`);
+      if (!Number.isFinite(num)) throw new Error(t('{field} 必须是数字', {field: t(field.label)}));
       return clampInt(num, field.min, field.max);
     }
     if (field.type === 'choice') {
       const selected = input.buttons.find(button => button.classList.contains('on'));
       const value = String(selected?.dataset?.value || '').trim();
       const allowed = (field.options || []).map(option => option.value);
-      if (!allowed.includes(value)) throw new Error(`${field.label} 取值无效`);
+      if (!allowed.includes(value)) throw new Error(t('{field} 取值无效', {field: t(field.label)}));
       return value;
     }
-    throw new Error('不支持的字段类型');
+    throw new Error(t('不支持的字段类型'));
   }
   function openConfigPanel() {
-    if (!document.body) { alert('页面尚未加载完成，请稍后重试。'); return; }
+    if (!document.body) { alert(t('页面尚未加载完成，请稍后重试。')); return; }
     ensureConfigStyle();
     document.getElementById(SB_CFG_MODAL_ID)?.remove();
     let settings;
     try {
       settings = loadSettings();
     } catch (error) {
-      alert(`无法打开配置：${error?.message || error}`);
+      alert(t('无法打开配置：{error}', {error: error?.message || error}));
       return;
     }
     const modal = document.createElement('div');
     modal.id = SB_CFG_MODAL_ID;
-    modal.innerHTML = '<div class="panel"><div class="head"><div><h2>⚙️ StreamBoost 全局参数</h2><p class="hint">作用于脚本匹配的所有网站与播放器 iframe；保存后刷新已打开页面生效。</p></div><div class="actions"><button data-act="close">关闭</button><button data-act="reset">恢复默认</button><button class="primary" data-act="save">保存全局配置</button></div></div><div class="layout"><div class="sections" data-zone="sections"></div></div></div>';
+    modal.lang = resolvedLanguage();
+    modal.innerHTML = `<div class="panel"><div class="head"><div><h2>${t('⚙️ StreamBoost 全局参数')}</h2><p class="hint">${t('作用于脚本匹配的所有网站与播放器 iframe；保存后刷新已打开页面生效。')}</p></div><div class="actions"><button data-act="close">${t('关闭')}</button><button data-act="reset">${t('恢复默认')}</button><button class="primary" data-act="save">${t('保存全局配置')}</button></div></div><label class="language">${t('界面语言 / Language')} <select name="language"><option value="auto">${t('跟随浏览器')}</option><option value="zh">中文</option><option value="en">English</option></select></label><div class="layout"><div class="sections" data-zone="sections"></div></div></div>`;
+    const languageSelect = modal.querySelector('[name="language"]');
+    languageSelect.value = settings.language;
     const controls = new Map();
     const syncTargetControls = (field, value, editingInput = null) => {
       if (!BUFFER_TARGET_KEYS.includes(field.key)) return;
@@ -270,14 +341,14 @@
       if (!groupGrid) {
         const group = document.createElement('section');
         group.className = 'group';
-        group.innerHTML = `<h3>${field.group}</h3><div class="group-grid"></div>`;
+        group.innerHTML = `<h3>${t(field.group)}</h3><div class="group-grid"></div>`;
         sectionsZone.appendChild(group);
         groupGrid = group.querySelector('.group-grid');
         groups.set(field.group, groupGrid);
       }
       const row = document.createElement('div');
       row.className = 'field';
-      row.innerHTML = `<div class="title">${field.label}</div>`;
+      row.innerHTML = `<div class="title">${t(field.label)}</div>`;
       let input = null;
       if (field.type === 'bool') {
         const wrap = document.createElement('div');
@@ -290,7 +361,7 @@
           const btn = document.createElement('button');
           btn.type = 'button';
           btn.className = 'switch-btn';
-          btn.textContent = opt.label;
+          btn.textContent = t(opt.label);
           btn.dataset.value = opt.value;
           btn.addEventListener('click', () => { for (const b of buttons) b.classList.remove('on'); btn.classList.add('on'); });
           buttons.push(btn);
@@ -302,6 +373,8 @@
         row.innerHTML += `<div class="num"><input type="range" min="${field.min}" max="${field.max}" step="${field.step || 1}"><input type="number" min="${field.min}" max="${field.max}" step="${field.step || 1}"></div>`;
         const range = row.querySelector('input[type="range"]');
         const num = row.querySelector('input[type="number"]');
+        range.setAttribute('aria-label', t(field.label));
+        num.setAttribute('aria-label', t(field.label));
         range.addEventListener('input', () => { num.value = range.value; syncTargetControls(field, range.value); });
         num.addEventListener('input', () => {
           if (!num.value.trim()) return;
@@ -321,7 +394,7 @@
           const btn = document.createElement('button');
           btn.type = 'button';
           btn.className = 'chip';
-          btn.textContent = op.label;
+          btn.textContent = t(op.label);
           btn.dataset.value = op.value;
           btn.addEventListener('click', () => { for (const b of buttons) b.classList.remove('on'); btn.classList.add('on'); });
           buttons.push(btn);
@@ -346,11 +419,11 @@
           field.key,
           collectFieldControlValue(field, controls.get(field.key))
         ]));
-        updateRuntimeConfig(runtime);
-        alert('全局配置已保存；请刷新已打开的播放页面。');
+        updateRuntimeConfig(runtime, languageSelect.value);
+        alert(t('全局配置已保存；请刷新已打开的播放页面。'));
         close();
       } catch (e) {
-        alert(`保存失败：${e?.message || e}`);
+        alert(t('保存失败：{error}', {error: e?.message || e}));
       }
     });
     document.body.appendChild(modal);
@@ -359,28 +432,33 @@
   if (typeof GM_registerMenuCommand === 'function' && window.top === window) {
     const host = normHost(location.hostname);
     const siteDisabled = isHostDisabled(host, bootSettings);
-    GM_registerMenuCommand(bootSettings.globalEnabled ? '🔌 全局状态（当前：启用）' : '🔌 全局状态（当前：停用）', () => {
+    GM_registerMenuCommand(t('🔌 全局状态（当前：{state}）', {state: t(bootSettings.globalEnabled ? '启用' : '停用')}), () => {
       try {
         const updated = updateSettings(current => ({ ...current, globalEnabled: !current.globalEnabled }));
-        alert(`已${updated.globalEnabled ? '启用' : '停用'}全局；请刷新已打开页面`);
+        alert(t('全局状态：{state}；请刷新已打开页面', {state: t(updated.globalEnabled ? '启用' : '停用')}));
       } catch (error) {
-        alert(`更新失败：${error?.message || error}`);
+        alert(t('更新失败：{error}', {error: error?.message || error}));
       }
     });
-    GM_registerMenuCommand(siteDisabled ? `✅ 移除当前主机名停用规则（${host}）` : `⛔ 停用当前主机名（${host}）`, () => {
+    GM_registerMenuCommand(t(siteDisabled ? '✅ 移除当前主机名停用规则（{host}）' : '⛔ 停用当前主机名（{host}）', {host}), () => {
       try {
         const current = loadSettings();
         const matchingRules = current.disabledHostPatterns.filter(pattern => hostMatches(host, pattern));
         if (matchingRules.length) {
           const broadRules = matchingRules.filter(pattern => pattern !== host);
-          if (broadRules.length && !confirm(`当前主机名由通配规则 ${broadRules.join('、')} 停用。\n移除后也会影响这些规则覆盖的其他主机名，是否继续？`)) return;
+          if (broadRules.length && !confirm(t('当前主机名由通配规则 {rules} 停用。\n移除后也会影响这些规则覆盖的其他主机名，是否继续？', {rules: broadRules.join(', ')}))) return;
           const confirmedRules = new Set(matchingRules);
           const updated = updateSettings(latest => ({
             ...latest,
             disabledHostPatterns: latest.disabledHostPatterns.filter(pattern => !confirmedRules.has(pattern))
           }));
           const stillDisabled = isHostDisabled(host, updated);
-          alert(`已移除确认的当前主机名停用规则：${host}${stillDisabled ? '\n当前主机名仍被其他新规则停用' : ''}${updated.globalEnabled ? '' : '\n全局开关仍处于停用状态'}\n请刷新页面`);
+          alert([
+            t('已移除确认的当前主机名停用规则：{host}', {host}),
+            ...(stillDisabled ? [t('当前主机名仍被其他新规则停用')] : []),
+            ...(updated.globalEnabled ? [] : [t('全局开关仍处于停用状态')]),
+            t('请刷新页面')
+          ].join('\n'));
         } else {
           let added = false;
           updateSettings(latest => {
@@ -388,21 +466,21 @@
             added = true;
             return { ...latest, disabledHostPatterns: [...latest.disabledHostPatterns, host] };
           });
-          alert(added ? `已停用当前主机名：${host}\n请刷新页面` : `当前主机名已由其他规则停用：${host}\n请刷新页面`);
+          alert(t(added ? '已停用当前主机名：{host}' : '当前主机名已由其他规则停用：{host}', {host})+'\n'+t('请刷新页面'));
         }
       } catch (error) {
-        alert(`更新失败：${error?.message || error}`);
+        alert(t('更新失败：{error}', {error: error?.message || error}));
       }
     });
-    GM_registerMenuCommand('⚙️ 打开参数配置页', openConfigPanel);
+    GM_registerMenuCommand(t('⚙️ 打开参数配置页'), openConfigPanel);
     GM_registerMenuCommand(
-      `🐞 Debug 日志（当前：${bootSettings.debugEnabled ? '启用' : '停用'}）`,
+      t('🐞 Debug 日志（当前：{state}）', {state: t(bootSettings.debugEnabled ? '启用' : '停用')}),
       () => {
         try {
           const updated = updateSettings(current => ({ ...current, debugEnabled: !current.debugEnabled }));
-          alert(`已${updated.debugEnabled ? '启用' : '停用'} Debug 日志；请刷新已打开页面`);
+          alert(t('Debug 日志：{state}；请刷新已打开页面', {state: t(updated.debugEnabled ? '启用' : '停用')}));
         } catch (error) {
-          alert(`更新失败：${error?.message || error}`);
+          alert(t('更新失败：{error}', {error: error?.message || error}));
         }
       }
     );
@@ -417,7 +495,7 @@
       const firstActivation = window.__HLS_BIGBUF_ACTIVE__ !== ACTIVE_MARKER;
       window.__HLS_BIGBUF_ACTIVE__ = ACTIVE_MARKER;
       if (firstActivation && DEBUG) console.log('[HLS BigBuffer] payload start', window === window.top ? 'top' : 'iframe');
-      if (firstActivation) console.info('[HLS BigBuffer] 已激活', window === window.top ? 'top' : 'iframe');
+      if (firstActivation) console.info('[HLS BigBuffer] Active', window === window.top ? 'top' : 'iframe');
     } catch {}
     const Native = (() => {
       let XHR   = window.XMLHttpRequest;
@@ -1399,7 +1477,7 @@
     try {
       if (isBlockedForDoc(doc, bootSettings, location.hostname)) {
         if (window.top === window) {
-          try { console.log('[HLS BigBuffer] 已在该站点禁用'); } catch {}
+          try { console.log('[HLS BigBuffer] Disabled on this site'); } catch {}
         }
         return;
       }
