@@ -20,3 +20,12 @@ Captured while correcting StreamBoost's configuration scope in July 2026. See `.
 - Validation rule: test more than the fullscreen root dimensions. Confirm the site's fullscreen-state class, the video and overlay rectangles, control placement at the viewport edge, aspect-ratio controls, and that the rendered media remains the original `<video>` element for driver features such as NVIDIA VSR.
 
 Captured while correcting YFSP container fullscreen behavior in August 2026. See `yfsp/yfsp-unlocker.js` and `yfsp/README.md`.
+
+## Quality selection belongs to the active media source
+
+- Root-cause pattern: a site's quality menu included purchased 4K as index 3 while the active HLS master had only three lower-resolution levels. Removing the client-only prompt still dispatched that index to the wrong source, leaving the native switch pending forever.
+- Routing rule: distinguish a menu option from a manifest level. Match labels only within the HLS instance whose URL belongs to the player's current media; use the site's native source-change lifecycle for independent sources. During rapid changes, old levels must not describe the newly assigned media.
+- Completion rule: selecting an already decoded level may emit no level-change event. End that no-op through the native completion method only when the current and requested levels agree and the video has usable, error-free data; genuine changes must retain event-driven completion.
+- Acceptance rule: verify source ownership, decoded dimensions, advancing playback time and return switches on the real account. A selectable menu item, purchase flag, successful manifest request or isolated fixture alone does not prove playback.
+
+Captured during the 2026-10-18 YFSP paid-4K incident. See `yfsp/API-PLAYBACK-ANALYSIS.md` section 19.

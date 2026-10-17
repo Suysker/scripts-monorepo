@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         YFSP.TV Unlocker
 // @namespace    http://tampermonkey.net/
-// @version      1.10.1
+// @version      1.10.2
 // @description  Uses the Windows client's playback endpoint, maps available HLS qualities, shows actual resolution and tunes VOD buffering. Adds click-to-toggle and container fullscreen.
 // @author       YFSP Analyst
 // @match        *://*.yfsp.tv/*
@@ -145,9 +145,9 @@ iframe[src*="doubleclick"],
 
     const hasPlayablePath = (item) => {
         const path = item?.path;
-        const nonempty = (value) => typeof value === 'string' && value.trim().length > 0;
-        return nonempty(path) || (path && typeof path === 'object' &&
-            (nonempty(path.result) || nonempty(path.dashResult))) || false;
+        // The web player's native source branch consumes path.result only.
+        // A desktop-only dashResult is not a playable source for this adapter.
+        return typeof path?.result === 'string' && path.result.trim().length > 0;
     };
     const readPreference = (key, fallback) => {
         try {
@@ -221,22 +221,23 @@ iframe[src*="doubleclick"],
 
     // A quality menu entry is not itself a playable source. Match the actual
     // manifest labels, never assume the menu order equals the HLS level order.
-    const resolveStandardQualityRoute = (item, player, hls) => {
-        if (!item) return { kind: 'delegate' };
+    const resolveQualityRoute = (item, player, hls) => {
+        if (!player) return { kind: 'pending' };
+        // The client routes high resolutions through their independent source,
+        // even when the current HLS master contains the lower resolutions.
         if (Number(item.bitrate) > 1080) return { kind: hasPlayablePath(item) ? 'source' : 'unavailable' };
-        if (player?.isMasterEnabled && !player.hasError) {
-            if (!hls?.levels?.length) return { kind: 'pending' };
-            const matches = hls.levels.flatMap((level, index) => {
+        if (player.isMasterEnabled && !player.hasError && hls?.url && hls.url === player.media?.src) {
+            const matches = (hls?.levels || []).flatMap((level, index) => {
                 const label = String(level.name || level.attrs?.NAME || '').trim();
-                return /^(576|720|1080)p?$/i.test(label) && Number(label.replace(/p$/i, '')) === Number(item.bitrate) ? [index] : [];
+                const resolution = /^(\d+)p?$/i.exec(label);
+                return resolution && Number(resolution[1]) === Number(item.bitrate) ? [index] : [];
             });
             if (matches.length === 1) return { kind: 'master', index: matches[0] };
             if (hasPlayablePath(item)) return { kind: 'source' };
-            const known = hls.levels.every(level => /^(576|720|1080)p?$/i.test(String(level.name || level.attrs?.NAME || '').trim()));
-            return { kind: matches.length || !known ? 'delegate' : 'unavailable' };
+            return { kind: hls?.levels?.length ? 'unavailable' : 'pending' };
         }
         if (hasPlayablePath(item)) return { kind: 'source' };
-        return { kind: player && !player.hasError && !hls?.levels?.length ? 'pending' : 'unavailable' };
+        return { kind: !player.hasError && !hls?.levels?.length ? 'pending' : 'unavailable' };
     };
 
     const restoreBufferConfig = () => {
@@ -1055,6 +1056,51 @@ iframe[src*="doubleclick"],
         return loggedIn;
     };
 
+    const dispatchQualitySelection = (component, item, select) => {
+        const player = findAngularComponent('aa-videoplayer',
+            entry => entry && typeof entry.onSelectBitrate === 'function');
+        const video = findMainVideoElement();
+        const hls = getVideoHls(video);
+        const route = resolveQualityRoute(item, player, hls);
+        if (route.kind === 'pending') {
+            showPlaybackNotice('正在读取播放列表，已保留原画质，请稍后重试。');
+            return;
+        }
+        if (route.kind === 'unavailable') {
+            showPlaybackNotice('当前未找到此画质可用的播放地址，已保留原画质。');
+            return;
+        }
+        // Menu order and live HLS levels are different contracts. Do not mutate
+        // the server's item when mapping a master level to its actual index.
+        const selection = route.kind === 'master' ? { ...item, qualityIndex: route.index } : item;
+        if (component._utility && Number.isFinite(component.API?.currentTime)) {
+            component._utility.preLoadPlaySecond = component.API.currentTime;
+        }
+        if (route.kind === 'master') {
+            const result = select(selection);
+            // Selecting the already decoded level does not emit LEVEL_SWITCHED.
+            // Complete only that no-op; real level changes keep native completion.
+            if (hls.currentLevel === route.index && hls.nextLevel === route.index &&
+                video.readyState >= 2 && !video.error) {
+                player.switchLevelComplete();
+            }
+            return result;
+        }
+
+        // Angular's quality event is synchronous. Select the native source branch
+        // for this dispatch only. Later selections verify the live source and
+        // levels rather than relying on the restored master flag alone.
+        // The native handler still signs the URL, preserves time and completes
+        // the switch on real player events. No independent SourceBuffer path.
+        const wasMasterEnabled = player.isMasterEnabled;
+        player.isMasterEnabled = false;
+        try {
+            return select(selection);
+        } finally {
+            player.isMasterEnabled = wasMasterEnabled;
+        }
+    };
+
     const patchQualitySelectorComponent = (component) => {
         if (!component || typeof component !== 'object') return;
 
@@ -1069,60 +1115,21 @@ iframe[src*="doubleclick"],
             // Resolve the real account every click, including login/logout while
             // this component is alive. A UI compatibility role is not ownership.
             const loggedIn = syncQualityUser(this);
-            if (!loggedIn && item && this.bitrateSelected?.key !== item.key) {
-                const player = findAngularComponent('aa-videoplayer',
-                    entry => entry && typeof entry.onSelectBitrate === 'function');
-                const route = resolveStandardQualityRoute(item, player, getVideoHls(findMainVideoElement()));
-                if (route.kind === 'pending') {
-                    showPlaybackNotice('正在读取播放列表，已保留原画质，请稍后重试。');
-                    return;
-                }
-                if (route.kind === 'delegate' && !hasPlayablePath(item)) {
-                    showPlaybackNotice('暂时无法确认此清晰度对应的播放地址，已保留原画质。可稍后重试或选择其他清晰度。');
-                    return;
-                }
-                if (route.kind !== 'master' && route.kind !== 'source' && !hasPlayablePath(item)) {
-                    showPlaybackNotice('当前清晰度没有可用的播放地址，已保留原画质。可尝试其他清晰度，或登录后重试。');
-                    return;
-                }
-                if (route.kind === 'master') item.qualityIndex = route.index;
-            }
+            if (item.key != null && this.bitrateSelected?.key === item.key) return;
             if (readPreference('yfsp.playbackOnly', false) && Number(item?.bitrate) > 1080) {
                 return originalSelect.call(this, item);
             }
-            if (hasClientOnlyGate && Number(item?.bitrate) <= 1080) {
-                const needsAccountFlow = item.isVIP && (!this._user?.id ||
-                    (!item.isBought && this._user?.roleId === 0));
-                if (!needsAccountFlow && this.bitrateSelected?.key !== item.key) {
-                    const player = findAngularComponent('aa-videoplayer',
-                        entry => entry && typeof entry.onSelectBitrate === 'function');
-                    const route = resolveStandardQualityRoute(item, player, getVideoHls(findMainVideoElement()));
-                    if (route.kind === 'pending') {
-                        showPlaybackNotice('正在读取播放列表，已保留原画质，请稍后重试。');
-                        return;
-                    }
-                    if (route.kind === 'unavailable') {
-                        showPlaybackNotice('当前播放列表没有此画质的层级，也未返回独立源；保留正在播放的画质。');
-                        return;
-                    }
-                    if (route.kind === 'master') item.qualityIndex = route.index;
-                    if (this._utility && Number.isFinite(this.API?.currentTime)) {
-                        this._utility.preLoadPlaySecond = this.API.currentTime;
-                    }
-                }
-                return originalSelect.call(this, item);
-            }
-            // Null paths may trigger login, purchase or manifest-level selection.
-            // Only adapt the known desktop-only gate; delegate other choices intact.
+            // Account confirmation precedes source validation: an unpaid item
+            // can legitimately have no URL until the user completes the purchase.
+            const needsPurchase = item.isVIP && loggedIn && !item.isBought && this._user.roleId === 0;
             if (hasClientOnlyGate && Number(item?.bitrate) > 1080 &&
                 typeof this?.onBitrateChange?.emit === 'function') {
-                if (item.key != null && this.bitrateSelected?.key === item.key) return;
-                if (item.isVIP && !this._user?.id) {
+                if (item.isVIP && !loggedIn) {
                     if (typeof this._userService?.showLoginDialog !== 'function') return originalSelect.call(this, item);
                     if (this.fsAPI?.isFullscreen) this.fsAPI.toggleFullscreen();
                     return this._userService.showLoginDialog(true);
                 }
-                if (item.isVIP && !item.isBought && this._user && this._user.roleId === 0) {
+                if (needsPurchase) {
                     if (typeof this._purchaseRequiredDialogService?.setState !== 'function' ||
                         typeof this._dnDialogService?.open !== 'function') return originalSelect.call(this, item);
                     if (this.fsAPI?.isFullscreen) this.fsAPI.toggleFullscreen();
@@ -1134,24 +1141,18 @@ iframe[src*="doubleclick"],
                         isLive: this.isLive, isShortDrama: this.isShortDrama
                     });
                 }
-                if (!hasPlayablePath(item)) {
-                    showPlaybackNotice('当前未返回此画质的独立源；保留正在播放的画质。');
-                    return;
-                }
                 // Keep the actual source/key and the normal player event chain.
                 // This removes only the desktop-app prompt, not server checks.
-                if (this._utility && Number.isFinite(this.API?.currentTime)) {
-                    this._utility.preLoadPlaySecond = this.API.currentTime;
-                }
-                this.bitrateSelected = item;
-                this.onBitrateChange.emit(item);
-                this.isActive = this.isOpen = false;
-                this.openList?.unsubscribe?.();
-                this.hiddenApi?.releaseControls?.();
-                showPlaybackNotice('已请求切换高清源；实际画质以视频分辨率为准。');
-                return;
+                return dispatchQualitySelection(this, item, selection => {
+                    this.bitrateSelected = selection;
+                    this.onBitrateChange.emit(selection);
+                    this.isActive = this.isOpen = false;
+                    this.openList?.unsubscribe?.();
+                    this.hiddenApi?.releaseControls?.();
+                });
             }
-            return originalSelect.call(this, item);
+            if (needsPurchase) return originalSelect.call(this, item);
+            return dispatchQualitySelection(this, item, selection => originalSelect.call(this, selection));
         };
 
         proto.__yfsp_select_patched = true;
